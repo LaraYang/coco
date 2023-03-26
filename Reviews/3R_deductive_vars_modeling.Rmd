@@ -1,0 +1,452 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+```{r, include=FALSE, warning=FALSE}
+library(stargazer)
+library(ggplot2)
+library(dplyr)
+library(MASS)
+# used to calculate cronbach's alpha
+library(psych)
+# used to produce correlation plots
+library(corrplot)
+# for LDA visualization
+library(LDAvis)
+# for sLDA model
+library(lda)
+# for providing list of stop words
+library(tm)
+# for running btm
+library(BTM)
+library(tidytext)
+library(tidyr)
+library(stringr)
+# for melting
+library(reshape2)
+# for calculating coherence
+library(Matrix)
+library(data.table)
+library(text2vec)
+# for robust SEs
+library(sandwich)
+library(lmtest)
+# for lasso & elastic net
+library(glmnet)
+# for cross-validating on alpha, not provided by glmnet
+library(caret)
+# for winsorizing
+library(DescTools)
+library(lfe)
+library(pROC)
+```
+
+```{r}
+rm(list=ls())
+fn = '~/Documents/CompCulture/spacespace/Coco/analyses_data/survey_hr_deductive_vars.csv'
+data = read.csv(fn)
+data = data %>% 
+  rename(
+    perf_dummy_2020 = X2020_perf_dummy,
+    perf_dummy_2019 = X2019_perf_dummy,
+    perf_2020 = X2020.Performance,
+    perf_2019 = X2019.Performance,
+    duration = Duration..in.seconds.,
+    job_function = Function,
+    tenure = Length.of.Service.in.Years
+    ) %>% rename_all(function(x) tolower(gsub("\\.+", "_", x)))
+data$race = as.character(data$race)
+data$race = as.factor(data$race)
+data$perf_dummy_2020 = as.factor(data$perf_dummy_2020)
+data$perf_dummy_2019 = as.factor(data$perf_dummy_2019)
+data = data[is.finite(data$duration),]
+data$fast_response = as.factor(ifelse(data$duration < quantile(data$duration, 0.1), 1, 0))
+data$we = data$pros_we + data$cons_we
+data$i = data$pros_i + data$cons_i
+data$they = data$pros_they + data$cons_they
+data = data[data$pros_toks_len > 0 & data$cons_toks_len > 0,]
+data$we_they = data$we / (data$they+1)
+data$we_i = data$we / (data$i + 1)
+data$toks_len_control = log(data$pros_toks_len + data$cons_toks_len)
+data$pros_toks_len = log(data$pros_toks_len)
+data$cons_toks_len = log(data$cons_toks_len)
+data$log_we_they_tot =  log(data$we/data$they + 1)
+data$log_we_tot =  log(data$we/data$toks_len_control + 1)
+data$log_they_tot = log(data$they/data$toks_len_control + 1)
+
+data$log_we_ppron = log(data$we_pronoun_prop+1)
+data$log_they_ppron = log(data$they_pronoun_prop+1)
+data$glassdoor_db_sentiment = ifelse(data$glassdoor_db_sentiment == 'POSITIVE', 1, 0)
+data$pros_db_sentiment = ifelse(data$pros_db_sentiment == 'POSITIVE', 1, 0)
+data$cons_db_sentiment = ifelse(data$cons_db_sentiment == 'POSITIVE', 1, 0)
+
+data$glassdoor_db_sentiment_weighted = ifelse(data$glassdoor_db_sentiment == 1, 1*data$glassdoor_db_score, -1*data$glassdoor_db_score)
+
+data$pros_all_prob = log(data$pros_all_prob)
+data$cons_all_prob = log(data$cons_all_prob)
+data$glassdoor_all_prob = log(data$glassdoor_all_prob)
+
+data$pros_inflated_prob = log(data$pros_inflated_prob)
+data$cons_inflated_prob = log(data$cons_inflated_prob)
+data$tenure = scale(log(data$tenure))
+for (name in names(data[59:185]))
+{
+  data[is.na(data[,name]), name]=0
+  data[, name] = log(data[,name]+1)
+}
+cor.test(data$we_i, data$mael_avg, method='spearman')
+```
+
+Performance Data
+```{r}
+perf_rating_percentage = read.csv("~/Documents/Stanford/Research/Collabera/Data/perf_rating_percentages.csv")
+perf_rating_likert = read.csv("~/Documents/Stanford/Research/Collabera/Data/perf_rating_likert.csv")
+perf_rating_percentage$perf_percentage_2019 = as.numeric(gsub("%", "", perf_rating_percentage$X2019_Perf_Type.Percentage.))
+perf_rating_percentage$perf_percentage_2020 = as.numeric(gsub("%", "", perf_rating_percentage$X2020_Perf_Type.Percentage.))
+perf_rating_percentage$perf_2019_std = scale(perf_rating_percentage$perf_percentage_2019)
+perf_rating_percentage$perf_2020_std = scale(perf_rating_percentage$perf_percentage_2020)
+
+perf_rating_likert$perf_rating_2019 = as.numeric(perf_rating_likert$X2019.Perf_Type.Rating.)
+perf_rating_likert$perf_rating_2020 = as.numeric(perf_rating_likert$X2020.Perf_Type.Rating.)
+perf_rating_likert$perf_2019_std = scale(perf_rating_likert$perf_rating_2019)
+perf_rating_likert$perf_2020_std = scale(perf_rating_likert$perf_rating_2020)
+
+# any duplicates?
+any(duplicated(c(perf_rating_likert$UID, perf_rating_percentage$UID)))
+
+perf_rating_likert$likert = 1
+perf_rating_percentage$likert = 0
+perf_rating = rbind(perf_rating_percentage[, !(names(perf_rating_percentage) %in% c('X2019_Performance', "X2019_Perf_Type.Percentage.", "X2020_Performance", "X2020_Perf_Type.Percentage.", "perf_percentage_2019", "perf_percentage_2020", "LINK"))],
+                    perf_rating_likert[, !(names(perf_rating_likert) %in% c('X2019.Performance', "X2019.Perf_Type.Rating.", "X2020.Performance", "X2020.Perf_Type.Rating.", "perf_rating_2019", "perf_rating_2020", "LINK"))])
+```
+
+Checking data integrity
+```{r, include=FALSE}
+merged_data = merge(data[, c('uid', 'tenure', 'job_title', 'division', 'department', 'job_function', 'work_location', 'work_state', 'work_country', 'legal_entity_name', 'year_of_birth', 'gender', 'eeo_code')], perf_rating, by.x='uid', by.y='UID', all=T)
+# already logged on the left hand side
+#all(merged_data$tenure == as.numeric(merged_data$Length.of.Service.in.Years), na.rm = T)
+all(merged_data$job_title == as.numeric(merged_data$Job.Title), na.rm = T)
+all(merged_data$division == as.numeric(merged_data$Division), na.rm = T)
+all(merged_data$department == as.numeric(merged_data$Department), na.rm = T)
+all(merged_data$job_function == as.numeric(merged_data$Function), na.rm = T)
+all(merged_data$work_location == as.numeric(merged_data$Work.Location), na.rm = T)
+all(merged_data$work_state == as.numeric(merged_data$Work.State), na.rm = T)
+all(merged_data$work_country == as.numeric(merged_data$Work.Country), na.rm = T)
+all(merged_data$legal_entity_name == as.numeric(merged_data$Legal.Entity.Name), na.rm = T)
+all(merged_data$year_of_birth == as.numeric(merged_data$year_of_birth), na.rm = T)
+all(merged_data$gender == as.numeric(merged_data$Gender), na.rm = T)
+all(merged_data$eeo_code == as.numeric(merged_data$EEO.Code), na.rm = T)
+```
+
+```{r}
+data = merge(data, perf_rating[,c('UID', 'perf_2019_std', 'perf_2020_std', 'likert')], by.x='uid', by.y='UID', all.x = T)
+corr.test(data[data$likert==1, c('bergami_org_num', 'burnout', 'perf_2019_std', 'perf_2020_std')], method='pearson', adjust = 'none')
+corr.test(data[data$likert==0, c('bergami_org_num', 'burnout', 'perf_2019_std', 'perf_2020_std')], method='pearson', adjust = 'none')
+```
+
+Linear Models
+```{r}
+# weighted or unweighted sentiment gives roughly the same results
+mod_bergami_org = lm(mael_avg ~  log_we_tot + as.factor(glassdoor_db_sentiment) + pros_all_prob + cons_all_prob + toks_len_control + 1, data=data[data$work_country != "India",])
+summary(mod_bergami_org)
+
+# weighted or unweighted sentiment gives roughly the same results
+mod_bergami_org = lm(bergami_org_num ~  log_we_tot + as.factor(glassdoor_db_sentiment) + pros_all_prob + cons_all_prob + toks_len_control + 1, data=data[data$work_country != "India",])
+summary(mod_bergami_org)
+
+# LIWC Categories:
+# Relevant Categories - social, money, work, leisure,family, feel, friends, affect, friends
+```
+
+
+Prepping data for interaction
+```{r}
+data$log_we_tot_pros = log(data$pros_we / data$pros_toks_len + 1)
+data$log_we_tot_cons = log(data$cons_we / data$cons_toks_len + 1)
+data$log_they_tot_pros = log(data$pros_they / data$pros_toks_len + 1)
+data$log_they_tot_cons = log(data$cons_they / data$cons_toks_len + 1)
+
+data$log_we_ppron_pros = log(data$pros_we_pronoun_prop+1)
+data$log_we_ppron_cons = log(data$cons_we_pronoun_prop+1)
+data$log_they_ppron_pros = log(data$pros_they_pronoun_prop+1)
+data$log_they_ppron_cons = log(data$cons_they_pronoun_prop+1)
+
+data$pros_db_sentiment_weighted = ifelse(data$pros_db_sentiment == 1, 1*data$pros_db_score, -1*data$pros_db_score)
+data$cons_db_sentiment_weighted = ifelse(data$cons_db_sentiment == 1, 1*data$cons_db_score, -1*data$cons_db_score)
+
+corr_mat = corr.test(data[data$work_country!="India", c('mael_avg', 'bergami_org_num', 'pros_liwc_family', 'pros_liwc_money', 'cons_liwc_family', 'cons_liwc_money', 'log_we_tot_pros', 'log_we_tot_cons', 'pros_db_sentiment_weighted', 'cons_db_sentiment_weighted', 'pros_all_prob', 'cons_all_prob', 'pros_finetuned_prob', 'cons_finetuned_prob', 'pros_all_prop', 'cons_all_prop', 'pros_finetuned_prop', 'cons_finetuned_prop', 'glassdoor_all_prob', 'glassdoor_finetuned_prob', 'pros_inflated_prob', 'cons_inflated_prob', 'glassdoor_db_sentiment_weighted')], method='pearson', adjust='none')
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='n', sig.level=0.05, method='color', tl.col='black', addCoef.col='black', number.digits=2, tl.srt=45, diag=F)
+cor.test(data$mael_avg[data$work_country!="India"], data$cons_finetuned_prob[data$work_country!="India"], method='spearman')
+
+mod_mael = lm(mael_avg ~  pros_liwc_family + pros_liwc_money + cons_liwc_money + cons_liwc_family + pros_all_prob + cons_all_prob + pros_db_sentiment_weighted + cons_db_sentiment_weighted + log_we_ppron_pros + log_we_ppron_cons + pros_toks_len + cons_toks_len, data=data[data$work_country != "India",])
+summary(mod_mael)
+
+mod_berg = lm(bergami_org_num ~  pros_liwc_family + pros_liwc_money + cons_liwc_money + cons_liwc_family+ pros_all_prob + cons_all_prob + pros_db_sentiment_weighted + cons_db_sentiment_weighted + log_we_ppron_pros + log_we_ppron_cons + pros_toks_len + cons_toks_len, data=data[data$work_country != "India",])
+summary(mod_berg)
+
+```
+
+
+```{r}
+glassdoor_distilbert = read.csv('~/Documents/CompCulture/spacespace/Coco/analyses_data/survey_hr_glassdoor_distilbert.csv')
+corr_mat = corr.test(glassdoor_distilbert[glassdoor_distilbert$Work.Country != "India", c('mael_avg', 'bergami_org_num', 'pros_finetuned_prob', 'cons_finetuned_prob', 'glassdoor_finetuned_prop', 'pros_finetuned_prop', 'cons_finetuned_prop', 'glassdoor_finetuned_prop')], method='pearson', adjust='none')
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='n', sig.level=0.05, method='color', tl.col='black', addCoef.col='black', number.digits=2, tl.srt=45, diag=F)
+
+```
+
+```{r}
+survey_type = 'bergami_org_num'
+to_interact_data=data[data$work_country != "India", c('pros_liwc_money', 'pros_liwc_family', 'cons_liwc_money', 'cons_liwc_family',
+                          'pros_finetuned_prob', 'cons_finetuned_prob', 
+                          'pros_db_sentiment_weighted', 'cons_db_sentiment_weighted', 
+                          'log_we_tot_pros', 'log_we_tot_cons', 'log_they_tot_pros', 'log_they_tot_cons',
+                          'pros_toks_len', 'cons_toks_len', survey_type)]
+to_interact_data = to_interact_data[is.finite(rowSums(to_interact_data)),]
+x = as.data.frame(to_interact_data[, names(to_interact_data) != survey_type] %>% scale(center=TRUE, scale=FALSE))
+x = model.matrix(~.^2, as.data.frame(x))
+y = to_interact_data[, survey_type]
+
+set.seed(12345)
+samp_size = floor(0.8 * nrow(x))
+train_inx = sample(seq_len(nrow(x)), size=samp_size)
+x_train = x[train_inx, ]
+x_test = x[-train_inx, ]
+y_train = y[train_inx]
+y_test = y[-train_inx]
+
+```
+
+Lasso
+```{r}
+set.seed(12345)
+alpha = 1
+eval_results <- function(true, predicted) {
+# predictive rsquared and correlation rsquared are the same if the model that generated
+# these predictions include an intercept
+data.frame(predictive = 1-sum((true-predicted)^2)/sum((true - ave(true))^2), squared = cor(true, predicted)^2)
+}
+# standardizing here seems to be preferred over standardizing using the scale version
+# standardizing using the scale version sometimes lead all y predictions to end up the same
+cv_lasso <- cv.glmnet(x_train, y_train, alpha = alpha, standardize=T, nfolds=10)
+optimal_lambda <- cv_lasso$lambda.min
+lasso_model <- glmnet(x_train, y_train, alpha = alpha, lambda = optimal_lambda, standardize=T)
+
+predictions_train <- predict(lasso_model, s = optimal_lambda, newx = x_train)
+eval_results(y_train, predictions_train)
+
+predictions_test <- predict(lasso_model, s = optimal_lambda, newx = x_test)
+eval_results(y_test, predictions_test)
+```
+
+Elastic Net
+```{r}
+set.seed(12345)
+# Set training control
+train_control <- trainControl(method = "cv",
+                              number = 10,
+                              search = "random",
+                              verboseIter = FALSE)
+# Train the model
+elnet_data = cbind(y_train, x_train)
+
+tuneGrid = expand.grid(alpha = seq(0.1, 1, by=0.1), lambda = seq(0.1, 1, by = 0.1))
+
+elastic_net_model <- train(y_train ~ .,
+                           data = elnet_data,
+                           method = "glmnet",
+                           preProcess = "scale",
+                           trControl = train_control)
+
+# Check multiple R-squared
+y_hat_enet <- predict(elastic_net_model, x_train, s=elastic_net_model)
+cor(y_train, y_hat_enet)^2
+y_actual <- predict(elastic_net_model, x_test, s=elastic_net_model)
+cor(y_actual, y_test)^2
+```
+
+Binary Models
+
+```{r}
+glm_data = data[, c('pros_liwc_family', 'pros_liwc_money', 'cons_liwc_money', 'cons_liwc_family',
+                          'pros_all_prob', 'cons_all_prob', 
+                          'pros_db_sentiment_weighted', 'cons_db_sentiment_weighted', 
+                          'log_we_tot_pros', 'log_we_tot_cons', 'log_they_tot_pros', 'log_they_tot_cons',
+                          'pros_toks_len', 'cons_toks_len', 'bergami_org_num', 'tenure')]
+glm_data = glm_data[is.finite(rowSums(glm_data)),]
+
+glm_data$bin_y = ifelse(glm_data$bergami_org_num >= 6, 1, 0)
+train_inx = createDataPartition(glm_data$bin_y, p = 0.8, list = F)
+
+simply_glm = glm(bin_y ~ pros_liwc_family + cons_liwc_money + cons_all_prob + pros_db_sentiment_weighted + cons_db_sentiment_weighted + log_they_tot_pros + log_they_tot_cons + pros_toks_len + cons_toks_len, family='binomial', data=glm_data)
+summary(simply_glm)
+
+yhat = simply_glm$fitted
+y = as.numeric(yhat > .5)
+roccurve = roc(y ~ simply_glm$y)
+auc(roccurve)
+```
+
+
+```{r}
+set.seed(12345)
+to_interact_data=data[, c('pros_liwc_family', 'pros_liwc_money', 'cons_liwc_money', 'cons_liwc_family',
+                          'pros_all_prob', 'cons_all_prob',
+                          'pros_db_sentiment_weighted', 'cons_db_sentiment_weighted',
+                          'log_we_tot_pros', 'log_we_tot_cons',
+                          'pros_toks_len', 'cons_toks_len', 'bergami_org_num', 'tenure')]
+to_interact_data = to_interact_data[is.finite(rowSums(to_interact_data)),]
+
+x = as.data.frame(to_interact_data[, !(names(to_interact_data) %in% c('bergami_org_num', 'tenure'))] %>% scale(center=TRUE, scale=FALSE))
+x = model.matrix(~.^2, as.data.frame(x))
+y_bin = ifelse(to_interact_data$bergami_org_num >= 6, 1, 0)
+train_inx = createDataPartition(y_bin, p = 0.8, list = F)
+x_train = x[train_inx, ]
+x_test = x[-train_inx, ]
+y_train = y_bin[train_inx]
+y_test = y_bin[-train_inx]
+alpha = 1
+# standardizing here seems to be preferred over standardizing using the scale version
+# standardizing using the scale version sometimes lead all y predictions to end up the same
+cv_lasso <- cv.glmnet(x_train, y_train, alpha = alpha, standardize=T, nfolds=10, family='binomial', type.measure='auc')
+optimal_lambda <- cv_lasso$lambda.min
+lasso_model <- glmnet(x_train, y_train, alpha = alpha, lambda = optimal_lambda, standardize=T, family='binomial')
+
+predicted_classes <- predict(lasso_model, s = optimal_lambda, newx = x_train, type="class")
+mean(predicted_classes == y_train)
+auc(roc(predicted_classes ~ y_train))
+
+predicted_classes <- predict(lasso_model, s = optimal_lambda, newx = x_test, type="class")
+mean(predicted_classes == y_test)
+auc(roc(predicted_classes ~ y_test))
+
+test_tenure = to_interact_data$tenure[-train_inx]
+
+aggregate(test_tenure, list(predicted_classes), mean)
+aggregate(test_tenure, list(y_test), mean)
+
+
+
+```
+
+Elastic Net
+```{r}
+elnet_data = cbind(y_train, x_train)
+elnet_data = as.data.frame(elnet_data)
+elnet_data$y_train = as.factor(ifelse(y_train == 1, 'yes', 'no'))
+
+set.seed(12345)
+# Set training control
+train_control <- trainControl(method = "cv",
+                              number = 5,
+                              search = "random",
+                              verboseIter = FALSE,
+                              classProbs=T)
+# Train the model
+elastic_net_model <- train(y_train ~ .,
+                           data = elnet_data,
+                           method = "glmnet",
+                           preProcess = "scale",
+                           family="binomial",
+                           type.measure='auc',
+                           trControl = train_control)
+
+y_hat_enet <- predict(elastic_net_model, x_train)
+mean(y_hat_enet == elnet_data$y_train)
+
+y_hat_test <- predict(elastic_net_model, x_test, s=elastic_net_model$finalModel$a0)
+y_test_bin = as.factor(ifelse(y_test == 1, 'yes','no'))
+mean(y_hat_test == y_test_bin)
+```
+
+```{r}
+library(e1071)
+set.seed(12345)
+to_interact_data=data[, c('pros_liwc_family', 'cons_liwc_money',
+                          'pros_all_prob', 'cons_all_prob', 
+                          'pros_db_sentiment_weighted', 'cons_db_sentiment_weighted',
+                          'log_we_tot_pros', 'log_we_tot_cons', 'log_they_tot_pros', 'log_they_tot_cons',
+                          'pros_toks_len', 'cons_toks_len', 'bergami_org_num', 'tenure')]
+to_interact_data = to_interact_data[is.finite(rowSums(to_interact_data)),]
+
+x = as.data.frame(to_interact_data[, !(names(to_interact_data) %in% c('bergami_org_num', 'tenure'))] %>% scale(center=TRUE, scale=FALSE))
+# Svm sensitive to overfitting
+x = as.data.frame(model.matrix(~.^2 + 0, as.data.frame(x)))
+
+y_bin = as.factor(ifelse(to_interact_data$bergami_org_num >= 6, 1, 0))
+train_inx = createDataPartition(y_bin, p = 0.8, list = F)
+x_train = x[train_inx, ]
+x_test = x[-train_inx, ]
+y_train = y_bin[train_inx]
+y_test = y_bin[-train_inx]
+
+svm_model = svm(y_train ~ ., data=as.data.frame(cbind(x_train, y_train)), type="C", kernel='radial')
+y_hat = predict(svm_model)
+mean(y_hat == y_train)
+
+y_hat_test = predict(svm_model, x_test)
+mean(y_hat_test == y_test)
+
+tuned = tune(svm, y_train ~ ., data=as.data.frame(cbind(x_train, y_train)), type="C", kernel='radial', ranges = list(gamma = c(0.001, 0.01, 0.1), cost = c(0.001, 0.01, 0.1, 1, 5, 10, 100)), tunecontrol=tune.control(cross=10))
+y_hat_train = predict(tuned$best.model, x_train)
+mean(y_hat_train == y_train)
+y_hat_test = predict(tuned$best.model, x_test)
+mean(y_hat_test == y_test)
+
+plot(tuned$best.model, as.data.frame(cbind(x_train, as.numeric(y_train))), formula=y_train~.)
+```
+
+Random Forest:
+Robust to correlated trees, which would be an issue in our case if we used bagging as bagging produces correlated trees when there are strong predictors included
+```{r}
+set.seed(12345)
+library(randomForest)
+to_interact_data=data[, c('pros_liwc_family', 'cons_liwc_money',
+                          'pros_all_prob', 'cons_all_prob', 'pros_inflated_prob', 'cons_inflated_prob', 
+                          'pros_db_sentiment_weighted', 'cons_db_sentiment_weighted',
+                          'log_we_tot_pros', 'log_we_tot_cons', 'log_they_tot_pros', 'log_they_tot_cons',
+                          'pros_toks_len', 'cons_toks_len', 'bergami_org_num', 'tenure')]
+to_interact_data = to_interact_data[is.finite(rowSums(to_interact_data)),]
+x = as.data.frame(to_interact_data[, !(names(to_interact_data) %in% c('bergami_org_num', 'tenure'))] %>% scale(center=TRUE, scale=FALSE))
+x = model.matrix(~.^2 + 0, as.data.frame(x))
+y_bin = as.factor(ifelse(to_interact_data$bergami_org_num >= 6, 1, 0))
+train_inx = createDataPartition(y_bin, p = 0.8, list = F)
+x_train = x[train_inx, ]
+x_test = x[-train_inx, ]
+y_train = y_bin[train_inx]
+y_test = y_bin[-train_inx]
+
+tuned_rf = tuneRF(x_train, y_train, stepFactor=1.5, ntreeTry=500, doBest=T)
+
+
+y_hat_test = predict(tuned_rf, x_train, type='class')
+mean(y_hat_test == as.factor(y_train))
+
+
+y_hat_test = predict(tuned_rf, x_test, type='class')
+mean(y_hat_test == as.factor(y_test))
+
+```
+
+Cross-Validation
+```{r}
+
+set.seed(1234)
+n_fold = 5
+folds<- sample(1:n_fold, nrow(x), replace=T)
+for(z in 1:n_fold) {
+  train<- which(folds!=z) ##the observations we will use to train the model
+  test<- which(folds==z) ##the observations we will use to test the model
+  part1<- cv.glmnet(x = dtm[train,], y = credit[train], alpha = 1, family = binomial) ##fitting the LASSO model on the data.
+  out_of_samp[test]<- predict(part1, newx= dtm[test,], s = part1$lambda.min, type =class) ##predicting the labels
+
+}
+conf_table<- table(predicted_classes, y_test) ##calculating the confusion table > round(sum(diag(conf table))/len(credit), 3)
+round(sum(diag(conf_table))/len(credit), 3)
+
+
+```
+

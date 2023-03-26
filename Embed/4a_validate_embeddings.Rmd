@@ -1,0 +1,309 @@
+---
+title: "R Notebook"
+output: pdf_document
+---
+```{r, echo=FALSE}
+rm(list=ls())
+library(lfe)
+library(stargazer)
+library(ggplot2)
+library(dplyr)
+library(MASS)
+# used to calculate cronbach's alpha
+library(psych)
+# used to produce correlation plots
+library(corrplot)
+# for robust SEs
+library(sandwich)
+library(lmtest)
+# for winsorizing
+library(DescTools)
+library(ppcor)
+library(OneR)
+library(pROC)
+library(survival)
+library(ordinal)
+# for GAM
+library(mgcv)
+# for plotting GAM objects
+library(visreg)
+library(DataCombine)
+
+```
+
+```{r}
+prep_df = function(data, idtf_measures, timekey) {
+  data = data[, !(names(data) %in% c("LINK", "UID", "Link", "responseid", 'pros', 'cons'))]
+  if (timekey == 'user') {
+    data = data[order(data$user_id),]
+  } else {
+    data = data[order(data$user_id, data[,timekey]),]
+  }
+  data = data %>% 
+    rename(
+      perf_dummy_2020 = X2020_perf_dummy,
+      perf_dummy_2019 = X2019_perf_dummy,
+      perf_2020 = X2020.Performance,
+      perf_2019 = X2019.Performance,
+      duration = Duration..in.seconds.,
+      job_function = Function,
+      tenure = Length.of.Service.in.Years
+      ) %>% rename_all(function(x) tolower(gsub("\\.+", "_", x)))
+  data$race = as.character(data$race)
+  data$race[data$race %in% c('Black or African American', 'Missing', 'Native Hawaiian or Other Pacific Islander')] = 'Other'
+  data$race = as.factor(data$race)
+  data$perf_dummy_2020 = as.factor(data$perf_dummy_2020)
+  data$perf_dummy_2019 = as.factor(data$perf_dummy_2019)
+  data$gender = relevel(data$gender, "Male")
+  data = data[is.finite(data$duration),]
+  data$fast_response = as.factor(ifelse(data$duration < quantile(data$duration, 0.1), 1, 0))
+  for (n in idtf_measures) {
+    data[,n] = scale(data[,n])
+  }
+  data$perf_rating_2020[data$perf_rating_2020=="" | data$perf_rating_2020=='Not Applicable'] = NA
+  data$perf_rating_2019[data$perf_rating_2019=="" | data$perf_rating_2019=='Not Applicable'] = NA
+  data$perf_rating_2020 = as.numeric(as.character(data$perf_rating_2020))
+  data$perf_percentage_2020 = (log(as.numeric(gsub("%", "", data$perf_percentage_2020))+1))
+  data$perf_rating_2019 = as.numeric(as.character(data$perf_rating_2019))
+  data$perf_percentage_2019 = (log(as.numeric(gsub("%", "", data$perf_percentage_2019))+1))
+  data$work_country = relevel(data$work_country, 'U.S.A.')
+  return(data)
+}
+
+weighted_mean = function(df, names, weights) {
+  sum = 0
+  for (i in 1:length(names)) {
+    w = weights[i]
+    if (w > 0) {
+      sum = sum + df[,names[i]]*w 
+    }
+  }
+  return(sum)
+}
+
+```
+
+```{r, echo=FALSE}
+# number of observations go down from 1122 to 884 for non-symmetric words, 764 to 464 when moving from mincount = 150 to 300
+idtf_data_dir = "/zfs/projects/faculty/amirgo-identification/coco_email_idtf_data/"
+df_quarterly = read.csv(paste0(idtf_data_dir, "embeddings_high_prob_eng_quarterly_50d_mincount300.csv"))
+
+baseline_i_we = 0.89321053 # extracted from company embeddings
+baseline_i_we_cluster = 0.8712702
+
+idtf_measures = c("i_we", "i_we_cluster", "i_we_symmetric", "i_avg_i", "we_avg_we", "i_avg_i_cluster", "we_avg_we_cluster", "i_company_i", "we_company_we", "i_company_i_cluster", "we_company_we_cluster", "i_avg_we", "i_avg_we_cluster", "i_company_we", "i_company_we_cluster")
+idtf_measures_internal = c(paste0(idtf_measures, '_internal'), "i_int_we_ext", "i_int_we_ext_cluster", "i_int_we_avg_ext", "i_int_we_avg_ext_cluster")
+
+idtf_measures_external = paste0(idtf_measures, '_external')
+
+df_quarterly = prep_df(df_quarterly, c(idtf_measures_internal, idtf_measures_external), 'quarter')
+
+```
+
+Special Processing for DF Quarterly
+
+```{r}
+df_quarterly$year = as.factor(strtrim(as.character(df_quarterly$quarter), 4))
+df_quarterly$quarter_num = as.numeric(substr(as.character(df_quarterly$quarter), 6,6))
+df_quarterly$timed_tenure = df_quarterly$tenure - (2020-as.numeric(as.character(df_quarterly$year))) - (2-df_quarterly$quarter_num)*0.25
+df_quarterly$timed_tenure = log(df_quarterly$timed_tenure + 0.00001)
+
+```
+
+```{r, echo=FALSE}
+
+df_users_validate = df_quarterly[df_quarterly$quarter == '2020Q3' & df_quarterly$work_country != "India", c('user_id', 'mael_avg', 'mael_1', 'mael_2', 'mael_3', 'mael_4', 'mael_5', 'mael_6', 'i_we_internal')]
+names(df_users_validate)[9] = "cossim(I, we), 2020Q3"
+df_users_validate = merge(df_users_validate, df_quarterly[df_quarterly$quarter == '2019Q3' & df_quarterly$work_country != "India", c('user_id', 'i_we_internal')], all = T)
+names(df_users_validate)[10] = "cossim(I, we), 2019Q3"
+df_users_validate = merge(df_users_validate, df_quarterly[df_quarterly$quarter == '2018Q3' & df_quarterly$work_country != "India", c('user_id', 'i_we_internal')], all = T)
+names(df_users_validate)[11] = "cossim(I, we), 2018Q3"
+
+corr_mat = corr.test(df_users_validate[, c("cossim(I, we), 2020Q3", "cossim(I, we), 2019Q3", "cossim(I, we), 2018Q3", 'mael_avg')], method='spearman', adjust='none')
+rownames(corr_mat$r) = colnames(corr_mat$r) = c("Language-Based Identification, 2020Q3", "Language-Based Identification, 2019Q3", "Language-Based Identification, 2018Q3", "Survey-Based Identification")
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='blank', sig.level=0.05, method='color', tl.col='black',  number.digits=2, tl.srt=15, diag=F, title="Correlation Matrix for Language-Based and Survey-Based Identification", mar=c(0,0,1,0), addCoef.col="black", col=gray.colors(200))
+
+corr_mat = corr.test(df_quarterly[df_quarterly$quarter == '2020Q3' & df_quarterly$work_country != "India", c('i_we_internal', 'bergami_org_num', 'mael_avg')], method='spearman', adjust='none')
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='blank', sig.level=0.05, method='color', tl.col='black',  number.digits=3, tl.srt=15, diag=F, title="Correlation Matrix for Quarterly Embeddings", mar=c(0,0,1,0), addCoef.col="black")
+nrow(df_quarterly[df_quarterly$quarter == '2020Q3' & df_quarterly$work_country != "India", c('i_we_internal', 'bergami_org_num', 'mael_avg')])
+```
+
+Analyzing all measures using I and we
+```{r, include=FALSE, echo=FALSE}
+corr_mat = corr.test(df_quarterly[df_quarterly$quarter == '2020Q3' & df_quarterly$work_country != "India", c("i_avg_i_internal", "i_avg_i_cluster_internal", "we_avg_we_internal", "we_avg_we_cluster_internal", "i_avg_we_internal", "i_avg_we_cluster_internal", "i_company_i_internal", "i_company_i_cluster_internal", "we_company_we_internal", "we_company_we_cluster_internal", "i_company_we_internal", "i_company_we_cluster_internal", 'i_int_we_ext', "i_int_we_ext_cluster", 'i_int_we_avg_ext', 'i_int_we_avg_ext_cluster', 'bergami_org_num', 'mael_avg')], method='spearman', adjust='none')
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='blank', sig.level=0.05, method='color', tl.col='black',  number.digits=2, tl.srt=45, diag=F, title="Correlation Matrix for Quarterly Embeddings", mar=c(0,0,1,0),addCoef.col="black")
+
+corr_mat = corr.test(df_quarterly[df_quarterly$quarter == '2020Q3' & df_quarterly$work_country != "India", c("i_we_internal", "me_us_internal", "my_our_internal", "mine_ours_internal", "myself_ourselves_internal", 'bergami_org_num', 'mael_avg')], method='spearman', adjust='none')
+
+df_quarterly$avg_idtf = rowMeans(df_quarterly[,c("i_we_internal", "me_us_internal", "my_our_internal", "mine_ours_internal", "myself_ourselves_internal")], na.rm=T)
+corr_mat=corr.test(df_quarterly[df_quarterly$quarter == '2020Q3' & df_quarterly$work_country != "India", c("avg_idtf", 'bergami_org_num', 'mael_avg')], method='spearman')
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='blank', sig.level=0.05, method='color', tl.col='black',  number.digits=2, tl.srt=45, diag=F, title="Correlation Matrix for Quarterly Embeddings", mar=c(0,0,1,0),addCoef.col="black")
+```
+
+Analyzing alternative measures
+Projection methods:
+In either projection methods, the dimension itself is constructed without projecting out frequency. In the no_freq version, all finetuning is done on the company embeddings after the frequency dimension was dropped, where the projection is frequency-removed words on dimension built with frequency in it. In the regular version, the frequency dimension is dropped at the person-quarter level, that allows for a calculation of the cosine similarity between i vs we, without dropping frequency for any of the projection methods.
+Either project emails on i vs we constructed in the company emails, or project emails
+```{r}
+df_quarterly_alternative = read.csv(paste0(idtf_data_dir, "embeddings_quarterly_50d_alternative_mincount150.csv"))
+df_quarterly_alternative$log_we_i = log((df_quarterly_alternative$num_we_words+1) / (df_quarterly_alternative$num_i_words+1))
+df_quarterly_alternative$num_i_words = log(df_quarterly_alternative$num_i_words+1)
+df_quarterly_alternative$num_we_words = log(df_quarterly_alternative$num_we_words+1)
+
+# none of the other measures are particular informative, and lead to significant drops in n. thus, they will not be used
+alternatives = c("i_we_mean_proj_internal",  "family_mean_proj_internal",  "belonging_mean_proj_internal", "pride_mean_proj_internal", "valence_mean_proj_internal", "log_we_i", "num_i_words", "num_we_words")
+#removed we_they_proj_toks
+# these measures are the same regardless of mincount as they are computed using GloVe vectors
+tot_alternatives = c("i_we_mean_proj_toks", "we_they_mean_proj_toks", "family_mean_proj_toks", "belonging_mean_proj_toks", "valence_mean_proj_toks", "disciplined_mean_proj_toks", "competitive_mean_proj_toks", "passionate_mean_proj_toks", "responsive_mean_proj_toks")
+
+org = c("i_we_mean_proj_org_internal", "i_we_pca_proj_org_internal", "family_mean_proj_org_internal", "family_pca_proj_org_internal", "belonging_mean_proj_org_internal", "belonging_pca_proj_org_internal", "pride_mean_proj_org_internal", "pride_pca_proj_org_internal", "valence_mean_proj_org_internal", "valence_pca_proj_org_internal")
+
+combined_df_quarterly = merge(df_quarterly, df_quarterly_alternative[,c("user_id", "quarter", "log_we_i", "num_we_words")], all=T, by=c("user_id", "quarter"))
+
+combined_df_quarterly$avg_idtf = weighted_mean(combined_df_quarterly, c("num_we_words", 'i_we_internal'), c(0.5, 0.5))
+combined_df_quarterly$norm_we = (combined_df_quarterly$num_we_words / (combined_df_quarterly$num_tokens+1))
+
+(corr_mat = corr.test(combined_df_quarterly[combined_df_quarterly$quarter == '2020Q3' & combined_df_quarterly$work_country != "India", c("num_we_words", "norm_we", 'bergami_org_num', 'mael_avg')], method='spearman', adjust='none'))
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='blank', sig.level=0.05, method='color', tl.col='black', number.digits=2, tl.srt=15, diag=F, title="Correlation Matrix for Quarterly Embeddings", mar=c(0,0,1,0), addCoef.col="black")
+
+corr_mat = corr.test(combined_df_quarterly[combined_df_quarterly$quarter == '2020Q3' & combined_df_quarterly$work_country != "India", c('num_we_words', 'avg_idtf', 'i_we_internal', 'bergami_org_num', 'bergami_dept_num', 'mael_avg')], method='spearman', adjust='none')
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='blank', sig.level=0.05, method='color', tl.col='black', number.digits=2, tl.srt=15, diag=F, title="Correlation Matrix for Quarterly Embeddings", mar=c(0,0,1,0), addCoef.col="black")
+
+```
+
+Combining Two Sets of Measures
+```{r}
+for (n in c("i_we_internal", "i_company_i_internal", "we_company_we_internal", "i_company_we_internal", "log_we_i")) {
+  earliest = by(combined_df_quarterly[is.finite(combined_df_quarterly[,n]), n], combined_df_quarterly[is.finite(combined_df_quarterly[,n]), "user_id"], head, n=1)
+  earliest = as.data.frame(do.call("rbind", as.list(earliest)))
+  earliest$user_id = row.names(earliest)
+  colnames(earliest) = c(paste0(n, '_beg'), 'user_id')
+  combined_df_quarterly  = merge(combined_df_quarterly, earliest, by = 'user_id', all = TRUE)
+  combined_df_quarterly[,paste0(n, '_change')] = (combined_df_quarterly[,n] - combined_df_quarterly[,paste0(n, '_beg')])/abs(combined_df_quarterly[, paste0(n, '_beg')]+0.0001)
+  combined_df_quarterly = slide(combined_df_quarterly, Var=n, GroupVar="user_id", slideBy=-1, NewVar=paste0("past_", n))
+  combined_df_quarterly = as.data.frame(combined_df_quarterly %>% group_by(user_id) %>% tidyr::fill(paste0("past_",n)) %>% ungroup())
+  combined_df_quarterly[,paste0(n, '_quarterly_change')] = (combined_df_quarterly[,n] - combined_df_quarterly[,paste0("past_", n )])/abs(combined_df_quarterly[, paste0("past_", n)]+0.0001) 
+}
+
+corr_mat = corr.test(combined_df_quarterly[combined_df_quarterly$quarter == '2020Q3' & combined_df_quarterly$work_country == "India", c('i_we_internal_change', 'i_we_internal_quarterly_change', 'i_company_i_internal_change', 'i_company_i_internal_quarterly_change', 'we_company_we_internal_change', 'we_company_we_internal_quarterly_change', 'i_company_we_internal_change', 'i_company_we_internal_quarterly_change', 'bergami_org_num', 'mael_avg')], method='spearman', adjust='none')
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='blank', sig.level=0.05, method='color', tl.col='black', number.digits=2, tl.srt=15, diag=F, title="Correlation Matrix for Quarterly Embeddings", mar=c(0,0,1,0), addCoef.col="black")
+
+
+mod_idtf_change = lm(mael_avg~i_we_internal+i_company_i_internal+we_company_we_internal+i_company_we_internal+i_we_internal_quarterly_change+i_company_i_internal_quarterly_change+we_company_we_internal_quarterly_change+i_company_we_internal_quarterly_change, data=combined_df_quarterly[combined_df_quarterly$quarter == '2020Q3' & combined_df_quarterly$work_country != "India",])
+summary(mod_idtf_change)
+
+combined_df_quarterly$avg_idtf = weighted_mean(combined_df_quarterly, c("i_we_internal", "i_company_i_internal", "we_company_we_internal", "i_company_we_internal", 'i_we_internal_quarterly_change', 'i_company_i_internal_quarterly_change', 'we_company_we_internal_quarterly_change',  'i_company_we_internal_quarterly_change'), c(0.7, 0.1, 0.1, 0.1, 0, 0, 0, 0))
+
+corr.test(combined_df_quarterly$avg_idtf[combined_df_quarterly$quarter == '2020Q3' & combined_df_quarterly$work_country == "India"], combined_df_quarterly$mael_avg[combined_df_quarterly$quarter == '2020Q3' & combined_df_quarterly$work_country != "India"], method='spearman')
+```
+
+
+```{r, echo=FALSE, results='asis'}
+stargazer(mod_idtf, mod_idtf_proj, mod_idtf_change, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p<0.1; * p<0.05; ** p<0.01; *** p<0.001"), notes.append=F, title="Predicting M&A Using Linguistic Measures")
+```
+
+Using Vectors in Supervised ML Fashion
+```{r}
+library(tidyr)
+library(glmnet)
+
+df_quarterly_vectors = read.csv(paste0(idtf_data_dir, "embeddings_quarterly_vectors_50d_mincount150.csv"))
+
+clean = function(ling_name, survey_name, num_features) {
+  y = df_quarterly_vectors[df_quarterly_vectors$quarter == '2020Q3' & df_quarterly_vectors$work_country != "India" & df_quarterly_vectors[,ling_name] != "" & is.finite(df_quarterly_vectors[,survey_name]), survey_name]
+  X = data.frame(df_quarterly_vectors[df_quarterly_vectors$quarter == '2020Q3' & df_quarterly_vectors$work_country != "India" & df_quarterly_vectors[,ling_name] != "" & is.finite(df_quarterly_vectors[,survey_name]), ling_name])
+  names(X) = 'variable'
+  X$variable = trimws(gsub("\n|\\[|\\]", "", X$variable))
+  X = X %>% separate(variable, sep=' +', into=paste0('f',as.character(c(1:num_features))))
+  X = as.data.frame(lapply(X, function(x) as.numeric(x)))
+  # this line has to come before the next, otherwise we lose ordering
+  y = y[is.finite(X$f1)]
+  X = X[is.finite(X$f1),]
+  return(as.data.frame(cbind(X,y)))
+}
+
+eval_results <- function(true, predicted) {
+# predictive rsquared and correlation rsquared are the same if the model that generated
+# these predictions include an intercept
+data.frame(predictive = 1-sum((true-predicted)^2)/sum((true - ave(true))^2), squared = corr.test(true, predicted, method='spearman')$r^2)
+}
+
+num_features=50
+df = clean("i_we_diff_internal", "mael_avg", num_features)
+set.seed(12345)
+smp_size <- floor(0.75 * nrow(df))
+train_ind <- sample(seq_len(nrow(df)), size = smp_size)
+train = df[train_ind,]
+test = df[-train_ind, ]
+
+# GAM prep
+features = paste0('f',as.character(c(1:num_features)))
+lm_formula = paste0("y ~ ", paste0(features,collapse = '+'))
+summary(lm(as.formula(lm_formula), data=train))
+
+gam_formula = paste0("y ~ ", paste0(paste0('s(f',as.character(c(1:num_features)), ')' ),collapse = '+'))
+gam_model = gam(as.formula(gam_formula), data = train)
+summary(gam_model)
+pred = predict.gam(gam_model,newdata=test[,features])
+corr.test(pred, test$y, method='spearman')
+
+alpha = 0.5
+# standardizing here seems to be preferred over standardizing using the scale version
+# standardizing using the scale version sometimes lead all y predictions to end up the same
+x_train = df[train_ind, features]
+x_test = df[-train_ind, features]
+y_train = df[train_ind, "y"]
+y_test = df[-train_ind, "y"]
+
+set.seed(12345)
+cv_lasso <- cv.glmnet(as.matrix(x_train), (y_train), alpha = alpha, standardize=T, nfolds=10)
+optimal_lambda <- cv_lasso$lambda.min
+lasso_model <- glmnet(as.matrix(x_train), y_train, alpha = alpha, lambda = optimal_lambda, standardize=T)
+
+predictions_train <- predict(lasso_model, s = optimal_lambda, newx = as.matrix(x_train))
+eval_results(y_train, predictions_train)
+
+predictions_test <- predict(lasso_model, s = optimal_lambda, newx = as.matrix(x_test))
+eval_results(y_test, predictions_test)
+
+
+```
+
+GAM Models Using Various Measures
+```{r}
+for (n in c("i_we_cluster_internal", "i_we_symmetric_internal", "log_we_i", 'i_we_mean_proj_toks')) {
+  combined_df_quarterly[,paste0(n, '_change')] = Winsorize(combined_df_quarterly[,paste0(n, '_change')], na.rm=T, probs = c(0.01, 0.99))
+  combined_df_quarterly[,paste0(n, '_quarterly_change')] = Winsorize(combined_df_quarterly[,paste0(n, '_quarterly_change')], na.rm=T, probs = c(0.01, 0.99))
+}
+gam_model_change <- gam(mael_avg ~ s(i_we_internal), data = combined_df_quarterly[combined_df_quarterly$quarter == '2020Q3' & combined_df_quarterly$work_country != "India",])
+
+gam_model_quarterly_change <- gam(bergami_org_num ~ s(i_we_cluster_internal) + s((i_we_cluster_internal_quarterly_change)) + s(i_we_symmetric_internal) + s(i_we_symmetric_internal_quarterly_change) + s(i_we_mean_proj_toks) + s(i_we_mean_proj_toks_quarterly_change) + s(log_we_i) + s(log_we_i_quarterly_change), data = combined_df_quarterly[combined_df_quarterly$quarter == '2020Q3',])
+
+summary(gam_model_change)
+visreg(gam_model_change)
+```
+
+Alternative Measures Using Context Vectors - Projection methods did not work, average context method cossim(i, we) predict identification, less so than Mittens
+```{r}
+df_quarterly_alternative = read.csv(paste0(idtf_data_dir, "embeddings_quarterly_avg_context_300d.csv"))
+corr_mat = corr.test(df_quarterly_alternative[df_quarterly_alternative$quarter == '2020Q3' & df_quarterly_alternative$i_context_fixed_num > 8000 & df_quarterly_alternative$we_context_fixed_num > 8000,c("i_we_sent", "i_we_fixed", "family_org_fixed", "family_org_sent", "valence_org_fixed", "valence_org_sent", "belonging_org_fixed", "belonging_org_sent", "pride_org_fixed", "pride_org_sent", "passionate_org_fixed", "passionate_org_sent", "competitive_org_fixed", "competitive_org_sent", "responsive_org_fixed", "responsive_org_sent", "disciplined_org_fixed", "disciplined_org_sent", "we_org_fixed", "we_org_sent", 'bergami_org_num', 'mael_avg')], method='spearman', adjust='none')
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='blank', sig.level=0.05, method='color', tl.col='black',  number.digits=2, tl.srt=45, diag=F, title="Correlation Matrix Using Context Vectors", mar=c(0,0,1,0), addCoef.col="black")
+
+```
+
+Resampling to determine the mechanical relationship between number of emails and cosine similarity
+```{r}
+library(reshape2)
+library(tidyr)
+df_sampling = read.csv(paste0(idtf_data_dir, "embeddings_resample_50d_mincount150.csv"))
+head(df_sampling_melt)
+df_sampling_melt = melt(data = df_sampling, id.vars = c("user_id", "num_emails"), measure.vars = c("sample_5", "sample_25", "sample_50", "sample_75", "sample_100"))
+names(df_sampling_melt) = c("user_id", "num_emails", "sample_size", "cossim")
+df_sampling_melt = df_sampling_melt %>% separate(sample_size, c("sample", "sample_size"), "_")
+df_sampling_melt$sample_size = as.numeric(df_sampling_melt$sample_size)*100
+cor.test(df_sampling_melt$sample_size, df_sampling_melt$cossim)
+df_sampling_melt = merge(df_sampling_melt, df_users, by="user_id")
+mod = felm(cossim ~ sample_size, data=df_sampling_melt)
+summary(mod)
+
+```

@@ -1,0 +1,602 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+```{r, include=FALSE, warning=FALSE}
+library(stargazer)
+library(ggplot2)
+library(dplyr)
+library(MASS)
+# used to calculate cronbach's alpha
+library(psych)
+# used to produce correlation plots
+library(corrplot)
+# for LDA visualization
+library(LDAvis)
+# for sLDA model
+library(lda)
+# for providing list of stop words
+library(tm)
+# for running btm
+library(BTM)
+library(tidytext)
+library(tidyr)
+library(stringr)
+# for melting
+library(reshape2)
+# for calculating coherence
+library(Matrix)
+library(data.table)
+library(text2vec)
+```
+
+
+```{r}
+rm(list=ls())
+# this file has not coded burnout
+fn = '~/Documents/CompCulture/spacespace/Coco/analyses_data/survey_hr_topic_modeling.csv'
+data = read.csv(fn)
+data = data %>% 
+  rename(
+    perf_dummy_2020 = X2020_perf_dummy,
+    perf_dummy_2019 = X2019_perf_dummy,
+    perf_2020 = X2020.Performance,
+    perf_2019 = X2019.Performance,
+    duration = Duration..in.seconds.,
+    job_function = Function,
+    tenure = Length.of.Service.in.Years
+    ) %>% rename_all(function(x) tolower(gsub("\\.+", "_", x)))
+data$race = as.factor(data$race)
+data$perf_dummy_2020 = as.factor(data$perf_dummy_2020)
+data$perf_dummy_2019 = as.factor(data$perf_dummy_2019)
+data$fast_response = as.factor(ifelse(data$duration < quantile(data$duration, 0.1), 1, 0))
+
+data$we = data$pros_we + data$story_we
+data$i = data$pros_i + data$story_i
+data$they = data$pros_they + data$story_they
+data$toks_len_control = data$pros_toks_len + data$story_toks_len
+data$log_we_they =  log(data$we/data$they + 1)
+data$log_we =  log(data$we/data$toks_len_control + 1)
+data$log_they = log(data$they/data$toks_len_control + 1)
+```
+
+Topic Model
+sLDA Pre-Processing
+```{r}
+tm_data = data
+tm_data$pros_cleaned = as.character(tm_data$pros_cleaned)
+tm_data$cons_cleaned = as.character(tm_data$cons_cleaned)
+tm_data$story_cleaned = as.character(tm_data$story_cleaned)
+tm_data$glassdoor_cleaned = as.character(tm_data$glassdoor_cleaned)
+# Dropped 35 observations with low quality response - either the same across columns or few number of tokens
+tm_data = tm_data[tm_data$low_quality_pros == 0 & tm_data$low_quality_cons == 0,]
+tm_data = droplevels(tm_data)
+num_tokens_total = sum(tm_data$pros_toks_len)
+num_doc = nrow(tm_data)
+avg_tokens = num_tokens_total/num_doc
+set.seed(1234)
+train_index = sample(nrow(tm_data), nrow(tm_data) * 0.8)
+train_data = tm_data[train_index,]
+test_data = tm_data[-train_index,]
+n_fold = 5
+train_data$folds = cut(seq_along(train_data$uid), n_fold, labels = FALSE)
+```
+
+```{r, warning=FALSE}
+
+predict_slda = function(corpus, mod, outcome, alpha, eta) {
+    yhat = slda.predict(corpus$documents, mod$topics, mod$model, alpha = alpha, eta = eta, num.iterations = 200, average.iterations = 100)
+    result = 1-sum((outcome-yhat)^2)/sum((outcome - ave(outcome))^2)
+    return(result)
+}
+
+predict_slda_controls = function(corpus, mod, outcome, data, alpha, eta, num.topics, adjusted) {
+    doc_sums_count = slda.predict.docsums(corpus$documents, mod$topics, alpha, eta, num.iterations = 200, average.iterations = 100)
+    props = t(doc_sums_count)/colSums(doc_sums_count) # P(topic|document)
+    df_theta = as.data.frame(props)
+    data_slda_analyses = cbind(df_theta, data)
+    formula = paste('bergami_org_num ~ 1 + pros_toks_len +', paste(paste0('V', seq_len(num.topics)), collapse="+"))
+    mod_slda_lm = lm(as.formula(formula), data=data_slda_analyses)
+    yhat = suppressWarnings(predict(mod_slda_lm, data_slda_analyses))
+    if (adjusted == TRUE) {
+      result = summary(mod_slda_lm)$adj.r.squared
+    } else {
+      result = 1-sum((outcome-yhat)^2)/sum((outcome - ave(outcome))^2)
+    }
+    return(result)
+}
+
+predict_btm = function(mod, data, aux_data, num.topics, adjusted) {
+    scores = predict(mod, data)
+    df_theta = as.data.frame(scores)
+    df_theta$uid = rownames(df_theta)
+    data_btm_analyses = merge(df_theta, aux_data, by = 'uid')
+    formula = paste('bergami_org_num ~ 1 + pros_toks_len +', paste(paste0('V', seq_len(num.topics)), collapse="+"))
+    mod_btm_lm = lm(as.formula(formula), data=data_btm_analyses)
+    if (adjusted == TRUE) {
+        result = summary(mod_btm_lm)$adj.r.squared
+    } else {
+        yhat = suppressWarnings(predict(mod_btm_lm, data_btm_analyses))
+        outcome = data_btm_analyses$bergami_org_num
+        result = 1-sum((outcome-yhat)^2)/sum((outcome - ave(outcome))^2)    
+    }
+    return(result)
+}
+
+train = function(train_data, train_outcome=NA, mod, tcm, N, num.e.iterations=20, num.m.iterations=20, iter=150, metric='mean_difference',
+                 alpha_v=c(0.01, 0.05, 0.1, 0.2, 0.5, 0.75), eta_v=c(0.01, 0.05, 0.1, 0.2, 0.5, 0.75), num_topics_v = seq(4, 16, 2)) {
+    set.seed(1234)
+    results = data.frame(matrix(ncol=4, nrow=0))
+    colnames(results) = c('Number of Topics', 'Alpha', 'Eta', 'Coherence')
+    top_n_words = 10
+    for (num.topics in num_topics_v) {
+        params = sample(c(-1, 1), num.topics, replace=TRUE)
+        for (alpha in alpha_v) {
+            for (eta in eta_v) {
+                if (mod == 'slda') {
+                    mod_slda_continuous = slda.em(documents=train_data$documents, K=num.topics, vocab=train_data$vocab,
+                        num.e.iterations=num.e.iterations, num.m.iterations=num.m.iterations, alpha=alpha, eta=eta, annotations=train_outcome,
+                        params, variance=var(train_outcome), logistic=F, method="sLDA")
+                    tw =  mod_slda_continuous$topics %>% top.topic.words(top_n_words, by.score = TRUE) #A character matrix with the top terms per topic (each column represents one topic)
+                    top_words = as.vector(tw)
+                    all_words = colnames(tcm)
+                    result = mean(coherence(tw, tcm, n_doc_tcm = N, metrics = metric)) 
+
+                } else if (mod == 'btm') {
+                    train_data = train_data[, c('uid', 'tok')]
+                    mod_btm = BTM(train_data, k=num.topics, alpha=alpha, beta=eta, iter=iter, background=TRUE, detailed=TRUE)
+                    tw = matrix(data=NA, nrow=top_n_words, ncol=num.topics)
+                    btm_terms = terms(mod_btm, top_n=top_n_words)
+                    for (i in c(1:num.topics)) {
+                        tw[,i] = as.character(btm_terms[[i]]$token)
+                    }
+                    result = mean(coherence(tw, tcm, n_doc_tcm = N, metrics = metric)) 
+
+                }
+                results[nrow(results)+1,] = c(num.topics, alpha, eta, result)
+            } 
+        }
+    }
+    return(results)
+}
+
+cv = function(train_data, n_fold, mod, predict = 'slda_1', num.e.iterations=10, num.m.iterations=4, iter=50,
+              alpha_v=c(0.05, 0.1, 0.2, 0.5, 0.75), eta_v=c(0.05, 0.1, 0.2, 0.5, 0.75), num_topics_v = seq(4, 16, 2), aux_data=NA, adjusted=FALSE) {
+    results = data.frame(matrix(ncol=4, nrow=0))
+    colnames(results) = c( 'Number of Topics', 'Alpha', 'Eta', 'R2')
+  
+    for (num.topics in num_topics_v) {
+        params = sample(c(-1, 1), num.topics, replace=TRUE)
+        for (alpha in alpha_v) {
+            for (eta in eta_v) {
+                r2 = rep(NA, n_fold)
+                for (fold in 1:n_fold) {
+                    cv_data = train_data[train_data$folds == fold, ]
+                    curr_train_data = train_data[train_data$folds != fold, ]
+                    if (mod == 'slda') {
+                        train_corpus = lexicalize(curr_train_data$pros_cleaned)
+                        cv_corpus = lexicalize(cv_data$pros_cleaned)
+                        train_outcome = curr_train_data$bergami_org_num
+                        cv_outcome = cv_data$bergami_org_num
+                        mod_slda_continuous <- slda.em(documents=train_corpus$documents,
+                                         K=num.topics,
+                                         vocab=train_corpus$vocab,
+                                         num.e.iterations=num.e.iterations, # the number of Gibbs sampling sweeps over the entire corpus for each iteration of EM
+                                         num.m.iterations=num.m.iterations, # the number of EM iterations to make
+                                         alpha=alpha,  # scalar Dirichlet hyperparameter for the topic distribution for each document; higher alpha indicates that each document represents more topics
+                                         eta=eta, # scalar Dirichlet hyperparameter for the topic distribution for word distribution for a topic
+                                         annotations=train_outcome, # the response variable
+                                         params, # initial parameters for vector of regression coefficients
+                                         variance=var(train_outcome), # variance of outcome
+                                         logistic=F,
+                                         method="sLDA")
+                        if (predict == 'slda_1') {
+                            r2[fold] = predict_slda(cv_corpus, mod_slda_continuous, cv_outcome, alpha, eta)
+                        } else if (predict == 'slda_2') {
+                            r2[fold] = predict_slda_controls(corpus, mod, cv_outcome, data, alpha, eta, num.topics, adjusted)
+                        }
+                    } else if (mod == 'btm') {
+                        cv_data = train_data[train_data$folds == fold, c('uid', 'tok')]
+                        curr_train_data = train_data[train_data$folds != fold, c('uid', 'tok')]
+                        mod_btm = BTM(curr_train_data,
+                            k=num.topics,
+                            alpha=alpha, # a high alpha-value means that each document is likely to contain a mixture of most of the topics, and not any single topic specifically. If we expect each document to only represent a few topics, then set alpha smaller than 1.
+                            beta=eta, # a high beta means that a topic may contain a mixture of most of the words, and not any word specifically. If we expect fewer topics, then set beta smaller than 1.
+                            iter=iter,
+                            background=TRUE, # whether the first topic is used to eliminate common words from later topics
+                            detailed=TRUE)
+                        result = predict_btm(mod, data, aux_data, num.topics, adjusted)
+                    }
+                }
+                results[nrow(results)+1,] = c(num.topics, alpha, eta, ave(r2))
+            }
+        }
+    }
+    return(results)
+}
+```
+
+sLDA with Training on Topic Coherence for Hyperparameter Grid Search
+```{r}
+library(Matrix)
+external_reference_corpus = readLines('~/Documents/CompCulture/Collabera/Analyses/helper_data/wikisent2.txt')
+tokens = space_tokenizer(train_data$glassdoor_cleaned)
+it = itoken(tokens)
+v = create_vocabulary(it)
+dtm = create_dtm(itoken(tokens), vocab_vectorizer(v))
+tcm = crossprod(sign(dtm)) #sign turns dtm into binary dtm; crossprod(x) is equivalent to t(x) %*% x, which gives term-term matrix
+# this is different from what we get out of create_tcm because the tcm we have here is based on co-occurence within the same document
+# whereas tcm by create_tcm is based on co=occurence within a sliding window
+
+tokens_ext = space_tokenizer(tolower(external_reference_corpus))
+iterator_ext = itoken(tokens_ext, progressbar = FALSE)
+v_ext = create_vocabulary(iterator_ext)
+# for reasons of efficiency vocabulary may be reduced to the terms matched in the original corpus
+v_ext= v_ext[v_ext$term %in% v$term, ]
+vectorizer_ext = vocab_vectorizer(v_ext)
+window_size = 5
+tcm_ext = create_tcm(itoken(tokens_ext), vectorizer_ext, skip_grams_window = window_size, weights = rep(1, window_size), binary_cooccurence = TRUE)
+diag(tcm_ext) = attributes(tcm_ext)$word_count
+n_skip_gram_windows = sum(sapply(tokens, function(x) {length(x)}))
+
+train_corpus = lexicalize(train_data$glassdoor_cleaned)
+results = train(train_data=train_corpus, train_outcome=train_data$bergami_org_num, mod='slda', tcm=tcm_ext, N=n_skip_gram_windows, metric='mean_npmi_cosim', num_topics_v = seq(6, 12, 2))
+```
+
+sLDA with Cross-Validating on R2 for Hyperparameter Grid Search
+```{r, warning=FALSE}
+results = cv(train_data, n_fold = n_fold, mod = 'slda', predict = 'slda_1', num.e.iterations = 20, num.m.iterations = 4, num_topics_v = seq(4, 12, 2), adjusted=FALSE)
+```
+
+Prediction on Test
+```{r}
+results = results[is.finite(results$Coherence),]
+num.topics = results[results$Coherence == max(results$Coherence), "Number of Topics"]
+alpha = results[results$Coherence == max(results$Coherence), "Alpha"]
+eta = results[results$Coherence == max(results$Coherence), "Eta"]
+test_corpus = lexicalize(test_data$glassdoor_cleaned)
+train_outcome = train_data$bergami_org_num
+test_outcome = test_data$bergami_org_num
+
+set.seed(1234)
+params = sample(c(-1, 1), num.topics, replace=TRUE)
+mod_slda_continuous <- slda.em(documents=train_corpus$documents,
+                   K=num.topics,
+                   vocab=train_corpus$vocab,
+                   num.e.iterations=20, # the number of Gibbs sampling sweeps over the entire corpus for each iteration of EM
+                   num.m.iterations=50, # the number of EM iterations to make
+                   alpha=alpha,  # scalar Dirichlet hyperparameter for the topic distribution for each document; higher alpha indicates that each document represents more topics
+                   eta=eta, # scalar Dirichlet hyperparameter for the topic distribution for word distribution for a topic
+                   annotations=train_outcome, # the response variable
+                   params, # initial parameters for vector of regression coefficients
+                   variance=var(train_outcome), # variance of outcome
+                   logistic=F,
+                   method="sLDA")
+
+doc_sums_count = slda.predict.docsums(test_corpus$documents, mod_slda_continuous$topics, 
+                                    alpha, eta, num.iterations = 200, average.iterations = 100)
+props = t(doc_sums_count)/colSums(doc_sums_count) # P(topic|document)
+df_theta = as.data.frame(props)
+data_slda_analyses = cbind(df_theta, test_data)
+formula = paste('bergami_org_num ~ 1 + glassdoor_toks_len +', paste(paste0('V', seq_len(num.topics-1)), collapse="+"))
+mod_slda_lm = lm(as.formula(formula), data=data_slda_analyses)
+summary(mod_slda_lm)
+yhat = suppressWarnings(predict(mod_slda_lm, data_slda_analyses))
+(predictive_r2 = 1-sum((test_outcome-yhat)^2)/sum((test_outcome - ave(test_outcome))^2))
+
+```
+
+Topics and Top Words
+```{r}
+# when by.score is set to FALSE, words are ranked according to probability mass for each word
+# when by.score is set to true, words are ranked according to a score that favors less general, more specific wwords to describe a topic
+topics <- mod_slda_continuous$topics %>% top.topic.words(8, by.score = TRUE) %>% apply(2, paste, 
+    collapse = ",")
+topics = paste('Topic', seq(1:num.topics), ':', topics)
+
+coefs <- data.frame(coef(summary(mod_slda_continuous$model)))
+coefs <- cbind(coefs, topics = factor(topics, topics[order(coefs$Estimate, coefs$Std..Error)]))
+coefs <- coefs[order(coefs$Estimate), ]
+coefs %>% ggplot(aes(topics, Estimate, colour = Estimate)) + geom_point() + geom_errorbar(width = 0.5, 
+    aes(ymin = Estimate - 1.96 * Std..Error, ymax = Estimate + 1.96 * Std..Error)) + 
+    coord_flip() + theme_bw()
+
+outcome = test_data$bergami_org_num
+ggplot_data = as.data.frame(cbind(yhat, outcome))
+ggplot(ggplot_data, aes(x=yhat, fill='Predicted', alpha=I(0.5)))+
+  geom_density(color=NA)+
+  geom_density(aes(x=outcome, fill='Observed', alpha=I(0.5)), color=NA)+
+  labs(fill='Rating',
+       x = "Rating",
+      y = "Density",
+      title = "Predicted and Observed Response")+
+  scale_fill_manual(name='Rating', values=c('cornflowerblue', 'lightskyblue'))+
+  theme_bw()
+```
+
+
+LDAVis for Supervised LDA
+```{r}
+theta = t(apply(mod_slda_continuous$document_sums + alpha, 2, function(x) x/sum(x)))
+phi = t(apply(t(mod_slda_continuous$topics) + eta, 2, function(x) x/sum(x)))
+# Note: this needs to be changed once we do cross-validation and testing
+docsize = table(train_data$uid)
+toks = data.frame(train_data[,c('pros_cleaned')])
+colnames(toks) = 'pros_cleaned'
+toks = toks %>% separate(pros_cleaned, into=paste0('tok_', seq_len(max(nchar(.$pros_cleaned)))), sep=' +') %>% unlist
+term.frequency = table(toks[!is.na(toks)])
+# the bar chart of terms is ranked by relevance, a measure developed the authors of LDAvis
+# when lambda = 1, words are ranked by  topic-specific probability; when lambda = 0, words are ranked by their lift, which generally decrease the rankings of frequently global terms
+# lambda = 0.6 is the optimal setting; lambda determines the weight in combining the two
+# see Sievert and Shirley 2014 for more details.
+json <- createJSON(
+  phi = phi,
+  theta = theta,
+  doc.length = as.integer(docsize),
+  vocab = train_corpus$vocab,
+  term.frequency = term.frequency)
+serVis(json)
+```
+
+BTM: Topic Modeling
+
+```{r}
+# Piesch & Lessmann 2018: the higher the k, the worse BTM performs in terms of topic coherence, but this effect is weaker compared to other methods dedicated to short-text topic modeling
+btm_train = train_data[, c('uid', 'glassdoor_cleaned', 'folds')] %>% separate(glassdoor_cleaned, into=paste0('tok_', seq_len(max(nchar(.$glassdoor_cleaned)))), sep=' +')
+# get rid of individuals with no data
+btm_train = droplevels(btm_train)
+btm_train = melt(btm_train, id.vars=c('uid', 'folds'))
+btm_train = btm_train[order(btm_train$uid, btm_train$folds),]
+btm_train = btm_train[!is.na(btm_train$value), c('uid', 'value', 'folds')]
+names(btm_train) = c('uid', 'tok', 'folds')
+
+#results = cv(btm_train, n_fold = 5, mod = 'btm', iter = 50, num_topics_v = seq(4, 12, 2), aux_data = train_data, adjusted = FALSE)
+results = train(btm_train, mod = 'btm', tcm=tcm_ext, metric = 'mean_npmi_cosim', N=length(table(btm_train$uid)), num_topics_v = seq(6, 12, 2))
+```
+
+```{r}
+num.topics = results[results$Coherence == max(results$Coherence), "Number of Topics"]
+alpha = results[results$Coherence == max(results$Coherence), "Alpha"]
+eta = results[results$Coherence == max(results$Coherence), "Eta"]
+btm_train = btm_train[,c('uid', 'tok')]
+mod_btm = BTM(btm_train,
+              k=num.topics,
+              alpha=alpha, # a high alpha-value means that each document is likely to contain a mixture of most of the topics, and not any single topic specifically. If we expect each document to only represent a few topics, then set alpha smaller than 1.
+              beta=eta, # a high beta means that a topic may contain a mixture of most of the words, and not any word specifically. If we expect fewer topics,  then set beta smaller than 1.
+              iter=150,
+              background=FALSE, # whether the first topic is used to eliminate common words from later topics
+              detailed=TRUE)
+
+docsize = table(btm_train$uid)
+scores = predict(mod_btm, btm_train)
+scores = scores[names(docsize), ]
+btm_test = test_data[, c('uid', 'glassdoor_cleaned')] %>% separate(glassdoor_cleaned, into=paste0('tok_', seq_len(max(nchar(.$glassdoor_cleaned)))), sep=' +')
+# get rid of individuals with no data
+btm_test = droplevels(btm_test)
+btm_test = melt(btm_test, id.vars=c('uid'))
+btm_test = btm_test[order(btm_test$uid),]
+btm_test = btm_test[!is.na(btm_test$value), c('uid', 'value')]
+names(btm_test) = c('uid', 'tok')
+docsize = table(btm_test$uid)
+head(btm_test)
+scores = predict(mod_btm, btm_test)
+scores = scores[names(docsize), ]
+
+df_theta = as.data.frame(scores)
+df_theta$uid = rownames(df_theta)
+data_btm_analyses = merge(df_theta, test_data, by = 'uid')
+formula = paste('bergami_org_num ~ 1 + glassdoor_toks_len +', paste(paste0('V', seq_len(num.topics)), collapse="+"))
+mod_btm_lm = lm(as.formula(formula), data=data_btm_analyses)
+summary(mod_btm_lm)
+yhat = suppressWarnings(predict(mod_btm_lm, data_btm_analyses))
+cv_outcome = data_btm_analyses$bergami_org_num
+(predictive_r2 = 1-sum((cv_outcome-yhat)^2)/sum((cv_outcome - ave(cv_outcome))^2) )
+```
+
+```{r}
+topic_tokens = matrix(data=NA, nrow=8, ncol=num.topics)
+btm_terms = terms(mod_btm, top_n=8)
+for (i in c(1:num.topics)) {
+  topic_tokens[,i] = as.character(btm_terms[[i]]$token)
+}
+
+topics = topic_tokens %>% apply(2, paste, collapse = ",")
+topics = paste('Topic', seq(1:num.topics), ':', topics)
+
+formula = paste('bergami_org_num ~ 0 + ', paste(paste0('V', seq_len(num.topics)), collapse="+"))
+mod_btm_plot = lm(as.formula(formula), data=data_btm_analyses)
+coefs <- data.frame(coef(summary(mod_btm_plot)))
+coefs <- cbind(coefs, topics = factor(topics, topics[order(coefs$Estimate, coefs$Std..Error)]))
+coefs <- coefs[order(coefs$Estimate), ]
+  
+coefs %>% ggplot(aes(topics, Estimate, colour = Estimate)) + geom_point() + geom_errorbar(width = 0.5, 
+    aes(ymin = Estimate - 1.96 * Std..Error, ymax = Estimate + 1.96 * Std..Error)) + 
+    coord_flip() + theme_bw()
+
+scores = predict(mod_btm, btm_train)
+scores = scores[names(docsize), ]
+json = createJSON(
+  phi= t(mod_btm$phi),
+  theta = scores,
+  doc.length = as.integer(docsize),
+  vocab = mod_btm$vocabulary$token,
+  term.frequency = mod_btm$vocabulary$freq)
+serVis(json)
+```
+
+General Summary Topics
+```{r}
+btm_pros = tm_data[, c('uid', 'pros_cleaned')] %>% separate(pros_cleaned, into=paste0('tok_', seq_len(max(nchar(.$pros_cleaned)))), sep=' +')
+# get rid of individuals with no data
+btm_pros = droplevels(btm_pros)
+btm_pros = melt(btm_pros, id.vars=c('uid'))
+btm_pros = btm_pros[order(btm_pros$uid),]
+btm_pros = btm_pros[!is.na(btm_pros$value), c('uid', 'value')]
+names(btm_pros) = c('uid', 'tok')
+num.topics = 6
+set.seed(1234)
+mod_btm = BTM(btm_pros,
+              k=num.topics,
+              alpha=0.1, # a high alpha-value means that each document is likely to contain a mixture of most of the topics, and not any single topic specifically. If we expect each document to only represent a few topics, then set alpha smaller than 1.
+              beta=0.25, # a high beta means that a topic may contain a mixture of most of the words, and not any word specifically. If we expect fewer topics,  then set beta smaller than 1.
+              iter=150,
+              background=TRUE, # whether the first topic is used to eliminate common words from later topics
+              detailed=TRUE)
+
+topic_tokens = matrix(data=NA, nrow=8, ncol=num.topics)
+btm_terms = terms(mod_btm, top_n=8)
+for (i in c(1:num.topics)) {
+  topic_tokens[,i] = as.character(btm_terms[[i]]$token)
+}
+
+topics = topic_tokens %>% apply(2, paste, collapse = ",")
+(topics = paste('Topic', seq(1:num.topics), ':', topics))
+docsize = table(btm_pros$uid)
+scores = predict(mod_btm, btm_pros)
+scores = scores[names(docsize), ]
+# json = createJSON(
+#   phi= t(mod_btm$phi),
+#   theta = scores,
+#   doc.length = as.integer(docsize),
+#   vocab = mod_btm$vocabulary$token,
+#   term.frequency = mod_btm$vocabulary$freq)
+# serVis(json)
+
+library(wordcloud)
+library(reshape2)
+top_n = 8
+topic_top_terms = matrix(nrow=0, ncol=3)
+for (i in c(1:num.topics)) {
+  topic_top_terms = rbind(topic_top_terms, cbind(rep(i, top_n), btm_terms[[i]]))
+}
+colnames(topic_top_terms) = c('topic', 'term', 'beta')
+
+topic_top_terms %>%
+  mutate(topic = paste("topic", topic)) %>%
+  acast(term ~ topic, value.var = "beta", fill = 0) %>%
+  comparison.cloud(title.size=2, use.r.layout = T, match.colors=T)
+
+```
+
+```{r}
+btm_cons = tm_data[, c('uid', 'cons_cleaned')] %>% separate(cons_cleaned, into=paste0('tok_', seq_len(max(nchar(.$cons_cleaned)))), sep=' +')
+# get rid of individuals with no data
+btm_cons = droplevels(btm_cons)
+btm_cons = melt(btm_cons, id.vars=c('uid'))
+btm_cons = btm_cons[order(btm_cons$uid),]
+btm_cons = btm_cons[!is.na(btm_cons$value), c('uid', 'value')]
+names(btm_cons) = c('uid', 'tok')
+btm_cons = btm_cons[!(btm_cons$tok %in% c('time')),]
+set.seed(1234)
+mod_btm = BTM(btm_cons,
+              k=num.topics,
+              alpha=0.05, # a high alpha-value means that each document is likely to contain a mixture of most of the topics, and not any single topic specifically. If we expect each document to only represent a few topics, then set alpha smaller than 1.
+              beta=0.25, # a high beta means that a topic may contain a mixture of most of the words, and not any word specifically. If we expect fewer topics,  then set beta smaller than 1.
+              iter=150,
+              background=TRUE, # whether the first topic is used to eliminate common words from later topics
+              detailed=TRUE)
+
+topic_tokens = matrix(data=NA, nrow=8, ncol=num.topics)
+btm_terms = terms(mod_btm, top_n=8)
+for (i in c(1:num.topics)) {
+  topic_tokens[,i] = as.character(btm_terms[[i]]$token)
+}
+
+topics = topic_tokens %>% apply(2, paste, collapse = ",")
+(topics = paste('Topic', seq(1:num.topics), ':', topics))
+
+scores = predict(mod_btm, btm_cons)
+scores = scores[names(docsize), ]
+json = createJSON(
+  phi= t(mod_btm$phi),
+  theta = scores,
+  doc.length = as.integer(docsize),
+  vocab = mod_btm$vocabulary$token,
+  term.frequency = mod_btm$vocabulary$freq)
+serVis(json)
+
+top_n = 8
+topic_top_terms = matrix(nrow=0, ncol=3)
+for (i in c(1:num.topics)) {
+  topic_top_terms = rbind(topic_top_terms, cbind(rep(i, top_n), btm_terms[[i]]))
+}
+colnames(topic_top_terms) = c('topic', 'term', 'beta')
+
+topic_top_terms %>%
+  mutate(topic = paste("topic", topic)) %>%
+  acast(term ~ topic, value.var = "beta", fill = 0) %>%
+  comparison.cloud(title.size=2, use.r.layout = T, match.colors=T)
+
+```
+
+Deprecated
+
+```{r}
+# Running analyses separately that include control variables
+doc_sums_count = slda.predict.docsums(corpus$documents, mod_slda_continuous$topics, 
+        alpha, eta, num.iterations = 100, average.iterations = 50)
+# P(topic|document)
+props = t(doc_sums_count)/colSums(doc_sums_count)
+df_theta = as.data.frame(props)
+df_theta$uid = tm_data$uid
+data_slda_analyses = merge(data[,c('uid', 'gender', 'race', 'work_country','bergami_org_num', 'pros_toks_len')], df_theta, by='uid')
+formula = paste('bergami_org_num ~ 1 + pros_toks_len + ', paste(paste0('V', seq_len(num.topics)), collapse="+"))
+mod_slda_lm = lm(as.formula(formula), data=data_slda_analyses)
+summary(mod_slda_lm)
+```
+
+Prediction of Multinomial Model: Unused until I can figure out a stable multinomial supervised LDA model
+```{r, include=FALSE}
+# outcome = as.integer(tm_data$bergami_org_num-1)
+# mod_slda_multinom <- slda.em(documents=corpus$documents,
+#                    K=num.topics,
+#                    vocab=corpus$vocab,
+#                    num.e.iterations=10, # the number of Gibbs sampling sweeps over the entire corpus for each iteration of EM
+#                    num.m.iterations=5, # the number of EM iterations to make
+#                    alpha=0.01,  # scalar Dirichlet hyperparameter; higher alpha indicates that each document represents more topics
+#                    eta=0.01,
+#                    annotations=outcome, # the response variable
+#                    params, # initial parameters for vector of regression coefficients
+#                    variance=var(outcome), # variance of outcome
+#                    logistic=TRUE,
+#                    method="sLDA")
+# 
+
+# topics <- mod_slda_multinom$topics %>% top.topic.words(8, by.score = TRUE) %>% apply(2, paste, 
+#     collapse = ",")
+# Regression coefficients for each topic
+# sum = summary(mod_slda_multinom$model)
+# coefs <- cbind(sum, topics = factor(topics, topics[order(sum$coefficients, sum$standard.errors)]))
+# coefs <- coefs[order(sum$coefficients), ]
+# coefs %>% ggplot(aes(topics, Estimate, colour = Estimate)) + geom_point() + geom_errorbar(width = 0.5, 
+#     aes(ymin = Estimate - 1.96 * Std..Error, ymax = Estimate + 1.96 * Std..Error)) + 
+#     coord_flip() + theme_bw()
+# 
+# yhat = predict(mod_slda_multinom$model)
+# fix dodge issue
+# ggplot_data = as.data.frame(cbind(yhat, outcome))
+# ggplot(ggplot_data, aes(x=as.factor(yhat+1), fill='Predicted'))+
+#   geom_bar(stat='count', alpha=I(0.9), position=position_nudge(x=-0.3), width=0.3)+
+#   geom_bar(aes(x=as.factor(outcome+1), fill='Observed'), stat='count', alpha=I(0.9), width=0.3)+
+#   labs(fill='Rating')+
+#   scale_fill_manual(name='Rating', values=c('cornflowerblue', 'lightskyblue'))
+  
+```
+
+
+BTM Pre-Processing
+```{r}
+btm_data = tm_data[,c('uid', 'pros_cleaned')]
+btm_data = btm_data %>% separate(pros_cleaned, into=paste0('tok_', seq_len(max(nchar(.$pros_cleaned)))), sep=' +')
+# get rid of individuals with no data
+btm_data = droplevels(btm_data)
+btm_data = melt(btm_data, id.vars=c('uid'))
+btm_data = btm_data[order(btm_data$uid),]
+btm_data = btm_data[!is.na(btm_data$value), c('uid', 'value')]
+names(btm_data) = c('uid', 'tok')
+```
+

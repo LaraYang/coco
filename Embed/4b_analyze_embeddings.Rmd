@@ -1,0 +1,348 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+rm(list=ls())
+library(ggplot2)
+library(survival)
+library(ggfortify)
+library(lfe)
+# qqPlot
+library(car)
+# piping
+library(dplyr)
+# slide
+library(DataCombine)
+# function %nin%
+library(Hmisc)
+# merge
+library(data.table)
+# bin
+library(OneR)
+# coeftest
+library(lmtest)
+library(sandwich)
+# for winsorizing
+library(DescTools)
+
+
+```
+
+```{r}
+survey = read.csv("/Users/Lara/Documents/CompCulture/spacespace/Coco/analyses_data/survey_hr_deductive_vars.csv")
+cor.test(survey$bergami_org_num, survey$bergami_dept_num)
+```
+
+# Option 1) Using Cross-Sectional HR Data
+```{r}
+idtf_data_dir = "/ifs/projects/amirgo-identification/email_idtf_data/"
+data = read.csv(paste0(idtf_data_dir, "embeddings_high_prob_eng_quarterly_50d_mincount300.csv"))
+prep_df = function(data, idtf_measures, timekey) {
+  data = data[, !(names(data) %in% c("LINK", "UID", "Link", "responseid", 'pros', 'cons'))]
+  if (timekey == 'user') {
+    data = data[order(data$user_id),]
+  } else {
+    data = data[order(data$user_id, data[,timekey]),]
+  }
+  data = data %>% 
+    rename(
+      perf_dummy_2020 = X2020_perf_dummy,
+      perf_dummy_2019 = X2019_perf_dummy,
+      perf_2020 = X2020.Performance,
+      perf_2019 = X2019.Performance,
+      duration = Duration..in.seconds.,
+      job_function = Function,
+      tenure = Length.of.Service.in.Years,
+      ethnicity = Race
+      ) %>% rename_all(function(x) tolower(gsub("\\.+", "_", x)))
+  data$ethnicity = as.character(data$ethnicity)
+  data$ethnicity[data$ethnicity %in% c('Black or African American', 'Missing', 'Native Hawaiian or Other Pacific Islander')] = 'Other'
+  data$ethnicity = as.factor(data$ethnicity)
+  data$perf_dummy_2020 = as.factor(data$perf_dummy_2020)
+  data$perf_dummy_2019 = as.factor(data$perf_dummy_2019)
+  data$gender = as.factor(ifelse(data$gender == "Male", "M", ifelse(data$gender == "Female", "F", NA)))
+  data$gender = relevel(data$gender, "M")
+  data$fast_response = as.factor(ifelse(data$duration < quantile(data$duration, 0.1), 1, 0))
+  for (n in idtf_measures) {
+    data[,n] = scale(data[,n])
+  }
+  data$perf_rating_2020[data$perf_rating_2020=="" | data$perf_rating_2020=='Not Applicable'] = NA
+  data$perf_rating_2019[data$perf_rating_2019=="" | data$perf_rating_2019=='Not Applicable'] = NA
+  data$perf_rating_2020 = as.numeric(as.character(data$perf_rating_2020))
+  data$perf_percentage_2020 = ((as.numeric(gsub("%", "", data$perf_percentage_2020))))
+  data$perf_rating_2019 = as.numeric(as.character(data$perf_rating_2019))
+  data$perf_percentage_2019 = ((as.numeric(gsub("%", "", data$perf_percentage_2019))))
+  data$work_country = relevel(data$work_country, 'U.S.A.')
+  return(data)
+}
+
+df_quarterly = prep_df(data, c("i_we"), 'quarter')
+df_quarterly = df_quarterly[, c("user_id", "quarter", "mael_avg", "bergami_org", "tenure", "job_title", "division", "department", "job_function", "work_country", "work_location", "work_state", "gender", "ethnicity", "i_we", "perf_rating_2020", "perf_percentage_2020", "perf_rating_2019", "perf_percentage_2019")]
+df_quarterly$year = as.factor(strtrim(as.character(df_quarterly$quarter), 4))
+df_quarterly$quarter_num = as.numeric(substr(as.character(df_quarterly$quarter), 6,6))
+df_quarterly$timed_tenure = (df_quarterly$tenure - (2020-as.numeric(as.character(df_quarterly$year))) - (2-df_quarterly$quarter_num)*0.25)*365
+
+df_quarterly = merge(df_quarterly, aggregate(i_we ~ year + user_id, df_quarterly, mean))
+names(df_quarterly)[names(df_quarterly) == 'i_we'] = "i_we"
+names(df_quarterly)[names(df_quarterly) == 'V1'] = "i_we_avg"
+df_quarterly = slide(df_quarterly, Var='i_we', GroupVar="user_id", slideBy=-1, NewVar='past_i_we', reminder=FALSE)
+df_quarterly$high_i_we = ifelse(df_quarterly$i_we >= quantile(df_quarterly$i_we, probs = 0.7, na.rm=T), 1, 0)
+df_quarterly[is.finite(df_quarterly$i_we), "i_we_bin"] = bin(df_quarterly$i_we, nbins=4, labels=c(1,2,3,4), method='content')
+```
+
+
+# Option 2) Using Longitudinal HR Data
+```{r}
+df_quarterly = read.csv(paste0(idtf_data_dir, "embeddings_high_prob_eng_quarterly_50d_mincount300.csv"))
+long_hr = read.csv("/ifs/gsb/amirgo/spacespace/spacespace/Coco/analyses_data/longitudinal_hr.csv")
+df_quarterly = df_quarterly[, c("user_id", "uid", "quarter", "i_we_internal")]
+df_quarterly$i_we = scale(df_quarterly$i_we)
+df_quarterly = merge(df_quarterly, long_hr, by=c("uid", "quarter"))
+df_quarterly = df_quarterly %>%  rename(ethnicity = race)
+df_quarterly$ethnicity = as.character(df_quarterly$ethnicity)
+df_quarterly$ethnicity[df_quarterly$ethnicity %in% c('Black or African American', 'Missing', 'Native Hawaiian or Other Pacific Islander')] = 'Other'
+df_quarterly$ethnicity = as.factor(df_quarterly$ethnicity)
+df_quarterly$gender = as.factor(ifelse(df_quarterly$gender == "Male", "M", ifelse(df_quarterly$gender == "Female", "F", NA)))
+df_quarterly$gender = relevel(df_quarterly$gender, "M")
+df_quarterly$work_country = relevel(df_quarterly$work_country, 'U.S.A.')
+names(df_quarterly)[names(df_quarterly) == 'i_we'] = "i_we"
+```
+
+```{r}
+effort_df = read.csv(paste0(idtf_data_dir, "effort_quarterly_all.csv"))
+effort_df$num_messages_off = effort_df$num_messages_post_work+effort_df$num_messages_weekend
+effort_df$high_effort = ifelse(effort_df$num_messages_off >= quantile(effort_df$num_messages_off, .95), 1, 0)
+effort_df$num_work_emails = Winsorize(scale(log(effort_df$num_messages-effort_df$num_messages_off+1)))
+effort_df$num_messages_off = Winsorize(scale(log(effort_df$num_messages_off+1)))
+effort_df$num_messages = Winsorize(scale(log(effort_df$num_messages+1)))
+effort_df$num_working_weekends = Winsorize(scale(log(effort_df$num_working_weekends+1)))
+effort_df$avg_response_time = Winsorize(scale(log(as.numeric(effort_df$avg_response_time))))
+
+effort_df$peer_standardized_num_messages_off = effort_df$peer_standardized_num_messages_weekend+effort_df$peer_standardized_num_messages_post_work
+effort_df$peer_standardized_num_messages_off_log = Winsorize(scale(log(effort_df$peer_standardized_num_messages_off-min(effort_df$peer_standardized_num_messages_off, na.rm=T)+0.001)), na.rm=T)
+effort_df$peer_standardized_num_messages_off = Winsorize(scale(effort_df$peer_standardized_num_messages_off), na.rm=T)
+effort_df$peer_standardized_num_working_weekends_log = Winsorize(scale(log(effort_df$peer_standardized_num_working_weekends-min(effort_df$peer_standardized_num_working_weekends, na.rm=T)+0.001)), na.rm=T)
+effort_df$peer_standardized_num_working_weekends = Winsorize(scale(effort_df$peer_standardized_num_working_weekends), na.rm=T)
+
+effort_df$department_standardized_num_messages_off = effort_df$department_standardized_num_messages_weekend+effort_df$department_standardized_num_messages_post_work
+effort_df$department_standardized_num_messages_off_log = Winsorize(scale(log(effort_df$department_standardized_num_messages_off-min(effort_df$department_standardized_num_messages_off,na.rm=T)+0.001)), na.rm=T)
+effort_df$department_standardized_num_messages_off = Winsorize(scale(effort_df$department_standardized_num_messages_off), na.rm=T)
+effort_df$department_standardized_num_working_weekends_log = Winsorize(scale(log(effort_df$department_standardized_num_working_weekends-min(effort_df$department_standardized_num_working_weekends,na.rm=T)+0.001)), na.rm=T)
+effort_df$department_standardized_num_working_weekends = Winsorize(scale(effort_df$department_standardized_num_working_weekends), na.rm=T)
+df_quarterly = merge(df_quarterly, effort_df[, c("user_id", "quarter", "num_work_emails", "num_messages", "num_messages_off", "high_effort", "num_messages_weekend", "num_messages_post_work", "avg_response_time", "num_working_weekends", "peer_standardized_num_messages_off_log")], by=c("user_id", "quarter"), )
+
+df_quarterly_alternative = read.csv(paste0(idtf_data_dir, "embeddings_quarterly_50d_alternative_mincount150.csv"))
+df_quarterly_alternative$num_we_words = scale(log(df_quarterly_alternative$num_we_words+1))
+df_quarterly = merge(df_quarterly, df_quarterly_alternative[, c("user_id", "quarter", "num_we_words")], by=c("user_id", "quarter"), )
+
+df_quarterly$avg_idtf = (df_quarterly$i_we+df_quarterly$num_we_words)/2
+# People who joined during the pandemic are also those who are new to the organization, so identification of those who joined during the pandemic is also idnetification when someone is new
+
+df_quarterly = merge(df_quarterly, aggregate(i_we ~ year + user_id, df_quarterly, mean))
+names(df_quarterly)[names(df_quarterly) == 'V1'] = "i_we_avg"
+
+df_quarterly = merge(df_quarterly, aggregate(num_we_words ~ year + user_id, df_quarterly, mean))
+names(df_quarterly)[names(df_quarterly) == 'V1'] = "num_we_avg"
+
+df_quarterly = merge(df_quarterly, aggregate(avg_idtf ~ year + user_id, df_quarterly, mean))
+names(df_quarterly)[names(df_quarterly) == 'V1'] = "avg_idtf_avg"
+
+```
+
+
+```{r}
+# can't do survival analyses - no exit events
+# add models of tenure both within and between person
+df_tenure = df_quarterly[df_quarterly$work_country != "India",]
+mod_effort_within_coco = felm(num_messages_off ~ i_we + num_work_emails | user_id+quarter | 0 | user_id, df_tenure)
+summary(mod_effort_within_coco)
+
+mod_effort_between_coco = felm(num_messages_off ~ i_we + num_work_emails + gender | ethnicity +department + quarter | 0 | user_id, data=df_tenure)
+summary(mod_effort_between_coco)
+
+mod_peer_within_coco = felm(peer_standardized_num_messages_off_log ~ i_we + num_work_emails | user_id+quarter | 0 | user_id, data=df_tenure)
+summary(mod_peer_within_coco)
+
+mod_peer_between_coco = felm(peer_standardized_num_messages_off_log ~ i_we +  num_work_emails + gender | ethnicity +department+quarter | 0 | user_id, data=df_tenure)
+summary(mod_peer_between_coco)
+
+mod_response_within_coco = felm(avg_response_time ~ i_we | user_id+quarter | 0 | user_id, data=df_tenure)
+summary(mod_response_within_coco)
+
+mod_response_between_coco = felm(avg_response_time ~ i_we + gender | ethnicity+department+quarter | 0 | user_id, data=df_tenure)
+summary(mod_response_between_coco)
+
+```
+
+
+Analyze Performance Ratings
+
+```{r, echo=FALSE}
+mod_tenure_within = felm(avg_idtf ~ log(tenure) | user_id + quarter | 0 | user_id, data=df_tenure[df_tenure$tenure > 0, ])
+summary(mod_tenure_within)
+
+mod_tenure_between = felm(avg_idtf ~ poly(log(tenure), 2) + gender + ethnicity | division + quarter | 0 | user_id, data=df_tenure[df_tenure$tenure > 0, ])
+summary(mod_tenure_between)
+
+df_quarterly_perf = df_quarterly[df_quarterly$work_country != "India" & df_quarterly$year >= 2019,]
+df_quarterly_perf = df_quarterly_perf[!duplicated(df_quarterly_perf[,c("user_id", "year")]),]
+
+df_quarterly_perf$low_idtf_avg = as.factor(ifelse(df_quarterly_perf$i_we_avg <= quantile(df_quarterly_perf$i_we_avg, probs = c(0.25), na.rm=T), 1, 0))
+df_quarterly_perf$high_idtf_avg = as.factor(ifelse(df_quarterly_perf$i_we_avg >= quantile(df_quarterly_perf$i_we_avg, probs = c(0.75), na.rm=T), 1, 0))
+df_quarterly_perf[is.finite(df_quarterly_perf$i_we_avg), "i_we_avg_bin"] = bin(df_quarterly_perf$i_we_avg, nbins=5, method='content')
+
+mod_rating_idtf_linear = lm(perf_rating ~ num_we_avg + gender + ethnicity, data=df_quarterly_perf[df_quarterly_perf$year == 2019, ])
+summary(mod_rating_idtf_linear)
+```
+Analyaze Actual Performance
+```{r, echo=FALSE}
+mod_perc_idtf_linear = felm(log(perf_percentage+1) ~ avg_idtf_avg + gender + ethnicity + job_title, data=df_quarterly_perf[df_quarterly_perf$year == 2019, ])
+summary(mod_perc_idtf_linear)
+mod_perc_idtf_high = felm(log(perf_percentage+1) ~ high_idtf_avg + gender + ethnicity + log(tenure) | job_title, data=df_quarterly_perf[df_quarterly_perf$year == 2019, ])
+summary(mod_perc_idtf_high)
+mod_perc_idtf_low = felm(log(perf_percentage+1) ~ low_idtf_avg + gender + ethnicity + log(tenure) | job_title, data=df_quarterly_perf[df_quarterly_perf$year == 2019, ])
+summary(mod_perc_idtf_low)
+
+# predict extreme performance
+df_quarterly_perf$high_perf = as.factor(ifelse(df_quarterly_perf$perf_percentage >= quantile(df_quarterly_perf$perf_percentage, probs = 0.75, na.rm=T), 1, 0))
+df_quarterly_perf$low_perf = as.factor(ifelse(df_quarterly_perf$perf_percentage <= quantile(df_quarterly_perf$perf_percentage, probs = 0.25, na.rm=T), 1, 0))
+
+mod_perc_bin_75 = glm(high_perf ~ num_we_avg+gender+ethnicity+log(tenure)+job_title, df_quarterly_perf[df_quarterly_perf$year==2019,], family='binomial')
+summary(mod_perc_bin_75)
+mod_perc_bin_75 = glm(low_perf ~ num_we_avg+gender+ethnicity+log(tenure)+job_title, df_quarterly_perf[df_quarterly_perf$year==2019,], family='binomial')
+summary(mod_perc_bin_75)
+
+```
+Promotion, Salary Chanage, Demotion
+```{r}
+df_quarterly = slide(df_quarterly, Var='promotion', GroupVar="user_id", slideBy=-1, NewVar='past_promotion', reminder=FALSE)
+df_quarterly = slide(df_quarterly, Var='salary_increase', GroupVar="user_id", slideBy=-1, NewVar='past_salary_increase', reminder=FALSE)
+df_quarterly = slide(df_quarterly, Var='i_we', GroupVar="user_id", slideBy=-1, NewVar='past_i_we', reminder=FALSE)
+
+mod_promotion = felm(i_we ~ as.factor(past_promotion) + log(tenure) + department + gender + ethnicity | quarter | 0 | quarter, data=df_quarterly[df_quarterly$work_country != "India" & df_quarterly$past_salary_increase == 0, ])
+summary(mod_promotion)
+
+mod_promotion = felm(i_we ~ as.factor(past_salary_increase) + log(tenure) + department + gender + ethnicity | quarter  | 0 | quarter, data=df_quarterly[df_quarterly$work_country != "India" & df_quarterly$past_promotion == 0, ])
+summary(mod_promotion)
+
+# mod_promotion = glm(promotion ~ past_i_we + log(tenure) + gender + ethnicity + department , data=df_quarterly[df_quarterly$work_country != "India" & df_quarterly$salary_increase == 0, ])
+# summary(mod_promotion)
+
+mod_promotion = felm(num_we_words ~ as.factor(past_promotion) + log(tenure) + department + gender + ethnicity | quarter | 0 | quarter, data=df_quarterly[df_quarterly$work_country != "India" & df_quarterly$salary_increase == 0, ])
+summary(mod_promotion)
+
+mod_promotion = felm(num_we_words ~ as.factor(past_salary_increase) + log(tenure) + department + gender + ethnicity | quarter | 0 | quarter, data=df_quarterly[df_quarterly$work_country != "India" & df_quarterly$past_promotion == 0, ])
+summary(mod_promotion)
+
+mod_promotion = felm(avg_idtf ~ as.factor(past_promotion) + log(tenure) + department + gender + ethnicity | quarter | 0 | quarter, data=df_quarterly[df_quarterly$work_country != "India" & df_quarterly$salary_increase == 0, ])
+summary(mod_promotion)
+
+mod_promotion = felm(avg_idtf ~ as.factor(past_salary_increase) + log(tenure) + department + gender + ethnicity | quarter | 0 | quarter, data=df_quarterly[df_quarterly$work_country != "India" & df_quarterly$past_promotion == 0, ])
+summary(mod_promotion)
+
+# WITHIN PERSON MODS
+mod_promotion = felm(i_we ~ as.factor(past_promotion) + log(tenure) | user_id  | 0 | quarter, data=df_quarterly[df_quarterly$work_country != "India" & df_quarterly$past_salary_increase == 0, ])
+summary(mod_promotion)
+
+mod_promotion = felm(i_we ~ as.factor(past_salary_increase) + log(tenure)  | user_id   | 0 | quarter, data=df_quarterly[df_quarterly$work_country != "India" & df_quarterly$past_promotion == 0, ])
+summary(mod_promotion)
+
+
+```
+Getting a salary increase only leads to more we-words but not higher cosine similarity; Getting a promotion leads to an increase in both. There is no evidence of reverse causal by reverse lagging the two variables
+Does it make sense to argue the two as implicit vs explicit identification? performative vs authentic?
+```{r}
+library(reshape2)
+df_q3 = df_quarterly[df_quarterly$quarter == "2020Q3" & is.finite(df_quarterly$i_we_cluster_internal) & is.finite(df_quarterly$mael_avg),]
+vline = df_q3 %>% group_by(gender, work_country) %>% summarise_at(vars("i_we_cluster_internal"), mean)
+med = mean(df_q3$i_we_cluster_internal)
+ggplot(df_q3, aes(x=i_we_cluster_internal))+
+  geom_histogram(fill='tan3')+
+  facet_wrap(~ gender + work_country)+
+  labs(title = 'Organizational Identification: Bergami & Bagozzi',
+       x = 'Response to Visual Identification Questionnaire',
+       y = 'Number of Individuals')+
+  theme_classic()+
+  geom_vline(xintercept=med, color="black")+
+  geom_vline(data = vline, aes(xintercept = i_we_cluster_internal), color='tan3')
+
+plot_avg = function(data, group, title, x_lab, y_lab) {
+  df_avg_depart = aggregate(x = scale(Winsorize(data$i_we_cluster_internal), center=T), by = list(data[,group]), FUN=mean)
+  names(df_avg_depart) = c('department', 'Language-Based Identification')
+  df_avg_depart_mael = aggregate(x = scale(Winsorize(data$mael_avg), center=T), by = list(data[,group]), FUN=mean)
+  names(df_avg_depart_mael) = c('department', 'Survey-Based Identification')
+  df_avg_depart = merge(df_avg_depart, df_avg_depart_mael)
+  df_avg_depart = melt(df_avg_depart, id.vars='department')
+  
+  return (ggplot(df_avg_depart, aes(x=department, y=value, fill=variable))+
+    geom_bar(stat='identity', position='dodge')+
+    labs(title = title,
+         x = x_lab,
+         y = y_lab)+
+    theme_bw()+
+    scale_fill_manual("", values = c("Language-Based Identification" = "#8C1515", "Survey-Based Identification" = "#017C92"))+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.margin = margin(10,10,10,50))+
+    coord_flip())
+}
+plot_avg(df_q3, 'division', 'Organizational Identification by Division', 'Division', 'Identification')
+```
+
+```{r}
+df_q3$i_we_cluster_internal = scale(df_q3$i_we_cluster_internal)
+df_quarterly$i_we_cluster_internal = scale(df_quarterly$i_we_cluster_internal)
+
+df_q3$hierarchy = "Employee"
+df_q3$job_title = tolower(df_q3$job_title)
+df_q3$hierarchy = ifelse(grepl('chief', df_q3$job_title), 'Chief', df_q3$hierarchy)
+df_q3$hierarchy = ifelse(grepl('president', df_q3$job_title), 'President', df_q3$hierarchy)
+df_q3$hierarchy = ifelse(grepl('senior director', df_q3$job_title), 'Senior Director', df_q3$hierarchy)
+df_q3$hierarchy = ifelse(grepl('director', df_q3$job_title), 'Director', df_q3$hierarchy)
+df_q3$hierarchy = ifelse(grepl('manager', df_q3$job_title), 'Manager', df_q3$hierarchy)
+df_q3$hierarchy = ifelse(grepl('senior', df_q3$job_title), 'Senior', df_q3$hierarchy)
+df_q3$hierarchy = ifelse(grepl('lead', df_q3$job_title), 'Lead', df_q3$hierarchy)
+df_q3$hierarchy = factor(as.factor(df_q3$hierarchy), level=c("Employee", "Lead", "Senior", "Manager", "Director", "Senior Director", "President", "Chief"))
+plot_avg(df_q3[df_q3$hierarchy != 'Chief',], 'hierarchy', "Organizational Identification by Rank", "Rank", "Organizational Identification")
+ggplot(df_quarterly[df_quarterly$timed_tenure >=0, ], aes(x=timed_tenure, y=i_we_cluster_internal)) +
+  geom_smooth(method='lm', color='#8C1515') + 
+  ggtitle('Language-Based Organizational Identification on Tenure') +
+  xlab('Tenure (In Years)') +
+  ylab('Normalized Identification') +
+  scale_x_continuous(name="Tenure (In Years)", limits=c(0, 10))+
+  theme_bw()
+
+df_2019 = df_annual[df_annual$year==2019 & is.finite(df_annual$high_idtf),]
+df_2019$perf_percentage_2020_raw = exp(df_2019$perf_percentage_2020)-1
+mean_perf = aggregate(x = df_2019$perf_percentage_2020_raw, by = list(df_2019$high_idtf), FUN=mean, na.rm=T)
+names(mean_perf) = c('Identification', 'Performance')
+ggplot(mean_perf, aes(x=Identification, y=Performance, fill=Identification))+
+  geom_bar(stat='identity')+
+  labs(title = 'Performance and Language-Based Organizational Identification',
+       x = 'Identification',
+       y = 'Performance')+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.margin = margin(10,10,10,50))+
+  scale_fill_manual("", values = c("#8C1515", "#017C92"), labels=c("Bottom 90% in Identification", "Top 10% in Identification"))
+
+
+df_users$perf_percentage_2020 = as.numeric(gsub("%", "",  df_users$perf_percentage_2020))
+df = df_users[is.finite(df_users$perf_percentage_2020) & is.finite(df_users$i_we_cluster_internal),]
+
+df = df[df$perf_percentage_2020 != max(df$perf_percentage_2020),]
+ggplot(df, aes(x=perf_percentage_2020))+
+  geom_histogram(fill='#8C1515', bins=20)+
+  labs(title = 'Distribution of Performance Percentages',
+       x = 'Performance Percentage',
+       y = 'Number of Individuals')+
+  theme_bw()
+```
+

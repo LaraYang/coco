@@ -1,0 +1,92 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+rm(list=ls())
+pros_topics = read.csv('/ifs/projects/amirgo-identification/BTM/output_coco_pros/model/k20.pz_d', sep=' ', header = F)
+cons_topics = read.csv('/ifs/projects/amirgo-identification/BTM/output_coco_cons/model/k20.pz_d', sep=' ', header = F)
+survey_data = read.csv('/ifs/gsb/amirgo/spacespace/spacespace/Coco/analyses_data/survey_hr_topic_modeling.csv')
+
+k=20
+pros_topics = pros_topics[,1:k]
+cons_topics = cons_topics[,1:k]
+for (i in seq(1, k)) {
+  names(pros_topics)[i] = paste("pros_topic", i, sep='')
+}
+for (i in seq(1, k)) {
+  names(cons_topics)[i] = paste("cons_topic", i, sep='')
+}
+survey_data = cbind(survey_data, pros_topics, cons_topics)
+
+survey_data = survey_data %>% 
+  rename(
+    perf_dummy_2020 = X2020_perf_dummy,
+    perf_dummy_2019 = X2019_perf_dummy,
+    perf_2020 = X2020.Performance,
+    perf_2019 = X2019.Performance,
+    duration = Duration..in.seconds.,
+    job_function = Function,
+    tenure = Length.of.Service.in.Years
+    ) %>% rename_all(function(x) tolower(gsub("\\.+", "_", x)))
+survey_data$race = as.factor(survey_data$race)
+survey_data$perf_dummy_2020 = as.factor(survey_data$perf_dummy_2020)
+survey_data$perf_dummy_2019 = as.factor(survey_data$perf_dummy_2019)
+
+survey_data = survey_data[(survey_data$pros_toks_len > 0) & (survey_data$cons_toks_len > 0),]
+```
+
+```{r}
+corr.test(survey_data[,c('bergami_org_num', names(pros_topics))], adjust='none')
+
+survey_data$bin_y = as.factor(ifelse(survey_data$bergami_org_num >= 6, 1, 0))
+
+library(glmnet)
+formula = as.formula(paste("bin_y ~ 1 + ", paste(cbind(names(pros_topics)[2:k], names(cons_topics)[2:k]), collapse=" + "), sep=""))
+simply_glm = glm(formula, family='binomial', data=survey_data)
+summary(simply_glm)
+
+yhat = simply_glm$fitted
+y = as.numeric(yhat > .5)
+roccurve = roc(y ~ simply_glm$y)
+auc(roccurve)
+
+```
+
+```{r}
+formula = as.formula(paste("bergami_org_num ~ 1 + ", paste(cbind(names(pros_topics)[2:k], names(cons_topics)[2:k]), collapse=" + "), sep=""))
+mod_bergami = lm(formula, data=survey_data)
+summary(mod_bergami)
+```
+
+```{r}
+x = as.matrix(survey_data[, names(survey_data) %in% c(names(pros_topics), names(cons_topics))] %>% scale(center=TRUE, scale=FALSE))
+y = survey_data$bergami_org_num
+
+set.seed(12345)
+samp_size = floor(0.8 * nrow(x))
+train_inx = sample(seq_len(nrow(x)), size=samp_size)
+x_train = x[train_inx, ]
+x_test = x[-train_inx, ]
+y_train = y[train_inx]
+y_test = y[-train_inx]
+
+eval_results <- function(true, predicted) {
+# predictive rsquared and correlation rsquared are the same if the model that generated
+# these predictions include an intercept
+data.frame(predictive = 1-sum((true-predicted)^2)/sum((true - ave(true))^2), squared = cor(true, predicted)^2)
+}
+# standardizing here seems to be preferred over standardizing using the scale version
+# standardizing using the scale version sometimes lead all y predictions to end up the same
+alpha=0.5
+cv_lasso <- cv.glmnet(x_train, y_train, alpha = alpha, standardize=T, nfolds=10)
+optimal_lambda <- cv_lasso$lambda.min
+lasso_model <- glmnet(x_train, y_train, alpha = alpha, lambda = optimal_lambda, standardize=T)
+
+predictions_train <- predict(lasso_model, s = optimal_lambda, newx = x_train)
+eval_results(y_train, predictions_train)
+
+predictions_test <- predict(lasso_model, s = optimal_lambda, newx = x_test)
+eval_results(y_test, predictions_test)
+```

@@ -1,0 +1,398 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r, echo=FALSE}
+rm(list=ls())
+library(lfe)
+library(dplyr)
+library(stargazer)
+library(ggplot2)
+library(MASS)
+# for robust SEs
+library(sandwich)
+# tests autocorrelation
+library(lmtest)
+# for winsorizing
+library(DescTools)
+library(ppcor)
+library(OneR)
+library(pROC)
+# leading and lagging
+library(DataCombine)
+```
+
+```{r, echo=FALSE}
+idtf_data_dir = "/ifs/projects/amirgo-identification/email_idtf_data/"
+df_quarterly = read.csv(paste0(idtf_data_dir, "embeddings_high_prob_eng_quarterly_50d_mincount300.csv"))
+
+prep_df = function(data, idtf_measures, timekey) {
+  data = data[, !(names(data) %in% c("LINK", "UID", "Link", "responseid", 'pros', 'cons'))]
+  if (timekey == 'user') {
+    data = data[order(data$user_id),]
+  } else {
+    data = data[order(data$user_id, data[,timekey]),]
+  }
+  data = data %>% 
+    rename(
+      perf_dummy_2020 = X2020_perf_dummy,
+      perf_dummy_2019 = X2019_perf_dummy,
+      perf_2020 = X2020.Performance,
+      perf_2019 = X2019.Performance,
+      duration = Duration..in.seconds.,
+      job_function = Function,
+      tenure = Length.of.Service.in.Years
+      ) %>% rename_all(function(x) tolower(gsub("\\.+", "_", x)))
+  data$race = as.character(data$race)
+  data$race[data$race %in% c('Black or African American', 'Missing', 'Native Hawaiian or Other Pacific Islander')] = 'Other'
+  data$race = as.factor(data$race)
+  data$perf_dummy_2020 = as.factor(data$perf_dummy_2020)
+  data$perf_dummy_2019 = as.factor(data$perf_dummy_2019)
+  data$gender = relevel(data$gender, "Male")
+  data = data[is.finite(data$duration),]
+  data$fast_response = as.factor(ifelse(data$duration < quantile(data$duration, 0.1), 1, 0))
+  for (n in idtf_measures) {
+    data[,n] = scale(data[,n])
+  }
+  data$perf_rating_2020[data$perf_rating_2020=="" | data$perf_rating_2020=='Not Applicable'] = NA
+  data$perf_rating_2019[data$perf_rating_2019=="" | data$perf_rating_2019=='Not Applicable'] = NA
+  data$perf_rating_2020 = as.numeric(as.character(data$perf_rating_2020))
+  data$perf_percentage_2020 = (log(as.numeric(gsub("%", "", data$perf_percentage_2020))+1))
+  data$perf_rating_2019 = as.numeric(as.character(data$perf_rating_2019))
+  data$perf_percentage_2019 = (log(as.numeric(gsub("%", "", data$perf_percentage_2019))+1))
+  data$work_country = relevel(data$work_country, 'U.S.A.')
+  return(data)
+}
+
+names(df_quarterly)[names(df_quarterly) == 'i_we_internal']='i_we'
+df_quarterly = prep_df(df_quarterly, c('i_we'), 'quarter')
+df_quarterly$year = as.factor(strtrim(as.character(df_quarterly$quarter), 4))
+df_quarterly$quarter_num = as.numeric(substr(as.character(df_quarterly$quarter), 6,6))
+
+df_quarterly$timed_tenure = (df_quarterly$tenure - (2020-as.numeric(as.character(df_quarterly$year))) - (2-df_quarterly$quarter_num)*0.25)*365
+df_quarterly = df_quarterly[df_quarterly$timed_tenure >= 0,]
+# not adding 1 as this will turn any negative values to NAN, dropping them from analyses
+df_quarterly$log_tenure = as.numeric(scale(log(df_quarterly$timed_tenure + 1)))
+df_quarterly$hq = ifelse(df_quarterly$work_location == 'Basking Ridge (Allen Road)', 1, 0)
+
+
+df_quarterly_alternative = read.csv(paste0(idtf_data_dir, "embeddings_quarterly_50d_alternative_mincount150.csv"))
+df_quarterly_alternative$num_we_words = scale(log(df_quarterly_alternative$num_we_words+1))
+df_quarterly = merge(df_quarterly, df_quarterly_alternative[, c("user_id", "quarter", "num_we_words")], by=c("user_id", "quarter"), )
+
+df_quarterly$avg_idtf = (df_quarterly$i_we+df_quarterly$num_we_words)/2
+```
+
+```{r, echo=FALSE}
+df_network_unweighted_coco = read.csv(paste0(idtf_data_dir, 'network_quarterly_internal_unweighted.csv'))
+df_network_unweighted_coco$degree = df_network_unweighted_coco$indegree + df_network_unweighted_coco$outdegree
+network_measures = names(df_network_unweighted_coco)[3:length(names(df_network_unweighted_coco))]
+df_network_unweighted_coco = merge(df_quarterly, df_network_unweighted_coco)
+df_network_unweighted_coco = df_network_unweighted_coco[df_network_unweighted_coco$work_country != "India",]
+
+nbin=4
+labels=c(1,2,3,4)
+for (n in network_measures) {
+  df_network_unweighted_coco[is.finite(df_network_unweighted_coco[,n]), paste0(n, "_bin")] = (bin(df_network_unweighted_coco[,n], nbins=nbin, labels=labels, method='content'))
+}
+
+df_network_unweighted_coco$indegree = scale(log(df_network_unweighted_coco$indegree+1))
+df_network_unweighted_coco$outdegree = scale(log(df_network_unweighted_coco$outdegree+1))
+df_network_unweighted_coco$degree = scale(log(df_network_unweighted_coco$degree+1))
+df_network_unweighted_coco$betweenness_centrality = scale(log(df_network_unweighted_coco$betweenness_centrality+0.00001))
+df_network_unweighted_coco$eigenvalue_centrality = scale(log(df_network_unweighted_coco$eigenvalue_centrality+0.001))
+df_network_unweighted_coco$constraint = scale(log(df_network_unweighted_coco$constraint+0.00001))
+df_network_unweighted_coco$clustering = scale(log(df_network_unweighted_coco$clustering+0.00001))
+
+for (n in c(network_measures)) {
+  #df_network_unweighted_coco[,n] = Winsorize(df_network_unweighted_coco[,n], na.rm=T)
+  df_network_unweighted_coco = slide(df_network_unweighted_coco, Var=paste0(n), GroupVar="user_id", slideBy=-1, NewVar=paste0("past_", n), reminder=FALSE)
+  df_network_unweighted_coco = slide(df_network_unweighted_coco, Var=paste0(n, '_bin'), GroupVar="user_id", slideBy=-1, NewVar=paste0("past_", n, '_bin'), reminder=FALSE)
+  df_network_unweighted_coco[, paste0("change_", n)] = (df_network_unweighted_coco[, n]-df_network_unweighted_coco[,paste0("past_",n)])
+  df_network_unweighted_coco[, paste0('past_', n, '_bin')] = as.factor(df_network_unweighted_coco[, paste0('past_', n, '_bin')])
+}
+df_network_unweighted_coco = slide(df_network_unweighted_coco, Var="i_we", GroupVar="user_id", slideBy=-1, NewVar="past_i_we", reminder=FALSE)
+```
+
+```{r, echo=FALSE}
+
+mod_in = felm(i_we ~ indegree + log_tenure| user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_out = felm(i_we ~ outdegree + log_tenure| user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_eigen = felm(i_we ~ eigenvalue_centrality + log_tenure | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_between = felm(i_we ~ betweenness_centrality + log_tenure | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_clustering = felm(i_we ~ clustering + log_tenure + degree | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_constraint = felm(i_we ~ constraint + log_tenure + degree | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_gender_diversity_coco = felm(i_we ~ gender_diversity + log_tenure | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_gender_ingroup_coco = felm(i_we ~ gender_ingroup + log_tenure | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_race_diversity_coco = felm(i_we ~ race_diversity + log_tenure | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_race_ingroup_coco = felm(i_we ~ race_ingroup + log_tenure | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_ei_coco = felm(i_we ~ ei_index + log_tenure | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+
+
+mod_in = felm(i_we ~ indegree_bin + log_tenure | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_out = felm(i_we ~ outdegree_bin+ log_tenure  | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_eigen = felm(i_we ~ eigenvalue_centrality_bin + log_tenure| user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_between = felm(i_we ~ betweenness_centrality_bin+ log_tenure | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_clustering = felm(i_we ~ clustering_bin + log_tenure| user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_constraint = felm(i_we ~ constraint_bin + log_tenure| user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+
+summary(mod_in)
+summary(mod_out)
+summary(mod_eigen)
+summary(mod_between)
+summary(mod_clustering)
+summary(mod_constraint)
+summary(mod_gender_diversity_coco)
+summary(mod_gender_ingroup_coco)
+summary(mod_race_diversity_coco)
+summary(mod_race_ingroup_coco)
+summary(mod_ei_coco)
+
+
+
+mod_in_between_coco = felm(i_we ~ indegree + log_tenure | department+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_out_between_coco = felm(i_we ~ outdegree + log_tenure | department+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_eigen_between_coco = felm(i_we ~ eigenvalue_centrality + log_tenure + degree | department + quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_between_between_coco = felm(i_we ~ betweenness_centrality + log_tenure+ degree | department + quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_clustering_between_coco = felm(i_we ~ clustering + log_tenure + degree | department + quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_constraint_between_coco = felm(i_we ~ constraint + log_tenure + degree | department + quarter | 0 | user_id, data=df_network_unweighted_coco)
+
+summary(mod_in_between_coco)
+summary(mod_out_between_coco)
+summary(mod_eigen_between_coco)
+summary(mod_between_between_coco)
+summary(mod_clustering_between_coco)
+summary(mod_constraint_between_coco)
+# in spacespace between person constraint is pos+sig; within-person only weakly - including tenure, num tokens, num messages, and is supervisor as controls. Adding quarter as control doesn't change much. Constraint not lagged in spsp
+
+```
+
+```{r}
+mod_in = felm(i_we ~ change_indegree | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_out = felm(i_we ~ change_outdegree | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_eigen = felm(i_we ~ change_eigenvalue_centrality   | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_between = felm(i_we ~ change_betweenness_centrality  | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_clustering = felm(i_we ~ change_clustering | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco)
+mod_constraint = felm(i_we ~ change_constraint | user_id+quarter | 0 | user_id, data=df_network_unweighted_coco[is.finite(df_network_unweighted_coco$change_constraint),])
+
+summary(mod_in)
+summary(mod_out)
+summary(mod_eigen)
+summary(mod_between)
+summary(mod_clustering)
+summary(mod_constraint)
+```
+
+```{r, echo=FALSE}
+df_network_weighted_coco = read.csv(paste0(idtf_data_dir, 'network_quarterly_internal_weighted.csv'))
+df_network_weighted_coco$degree = df_network_weighted_coco$indegree + df_network_weighted_coco$outdegree
+network_measures = names(df_network_weighted_coco)[3:length(names(df_network_weighted_coco))]
+df_network_weighted_coco = merge(df_quarterly, df_network_weighted_coco)
+df_network_weighted_coco = df_network_weighted_coco[df_network_weighted_coco$work_country != 'India',]
+nbin=4
+labels=c(1,2,3,4)
+for (n in network_measures) {
+  df_network_weighted_coco[is.finite(df_network_weighted_coco[,n]), paste0(n, "_bin")] = (bin(df_network_weighted_coco[,n], nbins=nbin, labels=labels, method='content'))
+}
+
+df_network_weighted_coco$indegree = scale(log(df_network_weighted_coco$indegree+1))
+df_network_weighted_coco$outdegree = scale(log(df_network_weighted_coco$outdegree+1))
+df_network_weighted_coco$degree = as.numeric(scale(log(df_network_weighted_coco$degree + 1)))
+# betweenness centrality is hard to interpret in a weighted network, as it's computed using Dijkstra's algorithm that punishes weight in determining
+# the shortest paths
+df_network_weighted_coco$betweenness_centrality = scale(log(df_network_weighted_coco$betweenness_centrality+0.00001))
+df_network_weighted_coco$eigenvalue_centrality = scale(log(df_network_weighted_coco$eigenvalue_centrality+0.00001))
+df_network_weighted_coco$constraint = as.numeric(scale(log(df_network_weighted_coco$constraint+0.00001)))
+df_network_weighted_coco$clustering = as.numeric(scale(log(df_network_weighted_coco$clustering+0.00001)))
+# both diversity show weird distributions but hard to normalize
+# gender ingroup is relatively norm
+# race ingroup is right skewed and hard to normalize
+
+for (n in c(network_measures)) {
+  df_network_weighted_coco[,n] = Winsorize(df_network_weighted_coco[, n], na.rm=T)
+  df_network_weighted_coco = slide(df_network_weighted_coco, Var=paste0(n), GroupVar="user_id", slideBy=-1, NewVar=paste0("past_", n), reminder=FALSE)
+  df_network_weighted_coco[, paste0("change_", n)] = df_network_weighted_coco[, n]-df_network_weighted_coco[, paste0("past_",n)]
+  df_network_weighted_coco = slide(df_network_weighted_coco, Var=paste0(n, '_bin'), GroupVar="user_id", slideBy=-1, NewVar=paste0("past_", n, '_bin'), reminder=FALSE)
+  df_network_weighted_coco[, paste0('past_', n, '_bin')] = as.factor(df_network_weighted_coco[, paste0('past_', n, '_bin')])
+}
+df_network_weighted_coco = slide(df_network_weighted_coco, Var="i_we", GroupVar="user_id", slideBy=-1, NewVar="past_i_we", reminder=FALSE)
+df_network_weighted_coco = slide(df_network_weighted_coco, Var="avg_idtf", GroupVar="user_id", slideBy=-1, NewVar="past_avg_idtf", reminder=FALSE)
+df_network_weighted_coco = slide(df_network_weighted_coco, Var="num_we_words", GroupVar="user_id", slideBy=-1, NewVar="past_num_we_words", reminder=FALSE)
+df_network_weighted_coco = slide(df_network_weighted_coco, Var="log_tenure", GroupVar="user_id", slideBy=-1, NewVar=paste0("past_log_tenure"), reminder=FALSE)
+df_network_weighted_coco[, "change_i_we"] = df_network_weighted_coco$i_we - df_network_weighted_coco$past_i_we
+
+```
+
+
+```{r, echo=FALSE}
+
+# BETWEENPERSON MODS - work location and job title change over time, nth we can do about it both within and between person
+mod_in_coco_num_we = felm(indegree ~ past_num_we_words + log_tenure | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_out_coco_num_we = felm(outdegree ~ past_num_we_words + log_tenure | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_eigen_coco_num_we  = felm(eigenvalue_centrality ~ past_num_we_words + log_tenure  | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_between_coco_num_we  = felm(betweenness_centrality ~ past_num_we_words + log_tenure | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_clustering_coco_num_we  = felm(clustering ~ past_num_we_words + log_tenure + degree | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_constraint_coco_num_we  = felm(constraint ~ past_num_we_words + log_tenure + degree | quarter | 0 | user_id, data=df_network_weighted_coco)
+
+mod_in_coco_avg_idtf = felm(indegree ~ past_avg_idtf + log_tenure | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_out_coco_avg_idtf = felm(outdegree ~ past_avg_idtf + log_tenure | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_eigen_coco_avg_idtf = felm(eigenvalue_centrality ~ past_avg_idtf + log_tenure  | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_between_coco_avg_idtf = felm(betweenness_centrality ~ past_avg_idtf + log_tenure | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_clustering_coco_avg_idtf = felm(clustering ~ past_avg_idtf + log_tenure + degree | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_constraint_coco_avg_idtf = felm(constraint ~ past_avg_idtf + log_tenure + degree | quarter | 0 | user_id, data=df_network_weighted_coco)
+
+mod_in_coco = felm(indegree ~ past_i_we + log_tenure | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_out_coco = felm(outdegree ~ past_i_we + log_tenure | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_eigen_coco = felm(eigenvalue_centrality ~ past_i_we + log_tenure  | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_between_coco = felm(betweenness_centrality ~ past_i_we + log_tenure | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_clustering_coco = felm(clustering ~ past_i_we + log_tenure + degree | quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_constraint_coco = felm(constraint ~ past_i_we + log_tenure + degree | quarter | 0 | user_id, data=df_network_weighted_coco)
+
+
+mod_eigen_past_network_qfe_coco = felm(avg_idtf ~ past_eigenvalue_centrality + log_tenure  | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_between_past_network_qfe_coco = felm(avg_idtf ~ past_betweenness_centrality + log_tenure  | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_clustering_past_network_qfe_coco = felm(avg_idtf ~ past_clustering + log_tenure  | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_constraint_past_network_qfe_coco = felm(avg_idtf ~ past_constraint + log_tenure  | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+summary(mod_eigen_past_network_qfe_coco)
+summary(mod_between_past_network_qfe_coco)
+summary(mod_clustering_past_network_qfe_coco)
+summary(mod_constraint_past_network_qfe_coco)
+
+mod_eigen_past_i_we_qfe_coco = felm(eigenvalue_centrality ~ past_avg_idtf + log_tenure  | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_between_past_i_we_qfe_coco = felm(betweenness_centrality ~ past_avg_idtf + log_tenure  | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_clustering_past_i_we_qfe_coco = felm(clustering ~ past_i_we + log_tenure  | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_constraint_past_i_we_qfe_coco = felm(constraint ~ past_i_we + log_tenure  | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+summary(mod_eigen_past_i_we_qfe_coco)
+summary(mod_between_past_i_we_qfe_coco)
+summary(mod_clustering_past_i_we_qfe_coco)
+summary(mod_constraint_past_i_we_qfe_coco)
+
+mod_eigen_past_network_coco = felm(avg_idtf ~ past_eigenvalue_centrality + log_tenure  | user_id | 0 | user_id, data=df_network_weighted_coco)
+mod_between_past_network_coco = felm(avg_idtf ~ past_betweenness_centrality + log_tenure  | user_id | 0 | user_id, data=df_network_weighted_coco)
+mod_clustering_past_network_coco = felm(avg_idtf ~ past_clustering + log_tenure  | user_id | 0 | user_id, data=df_network_weighted_coco)
+mod_constraint_past_network_coco = felm(avg_idtf ~ past_constraint + log_tenure  | user_id | 0 | user_id, data=df_network_weighted_coco)
+summary(mod_eigen_past_network_coco)
+summary(mod_between_past_network_coco)
+summary(mod_clustering_past_network_coco)
+summary(mod_constraint_past_network_coco)
+
+mod_eigen_past_i_we_coco = felm(eigenvalue_centrality ~ past_avg_idtf + log_tenure  | user_id | 0 | user_id, data=df_network_weighted_coco)
+mod_between_past_i_we_coco = felm(betweenness_centrality ~ past_avg_idtf + log_tenure  | user_id | 0 | user_id, data=df_network_weighted_coco)
+mod_clustering_past_i_we_coco = felm(clustering ~ past_avg_idtf + log_tenure  | user_id | 0 | user_id, data=df_network_weighted_coco)
+mod_constraint_past_i_we_coco = felm(constraint ~ past_avg_idtf + log_tenure  | user_id | 0 | user_id, data=df_network_weighted_coco)
+
+summary(mod_between_past_i_we_coco)
+summary(mod_eigen_past_i_we_coco)
+summary(mod_clustering_past_i_we_coco)
+summary(mod_constraint_past_i_we_coco)
+
+mod_clustering_coco_lm = lm(i_we ~ clustering + log_tenure + degree + user_id + quarter, data=df_network_weighted_coco)
+mod_constraint_coco_lm = lm(i_we ~ constraint + log_tenure + degree + user_id + quarter, data=df_network_weighted_coco)
+plot(mod_clustering_coco)
+clustering_plot <- ggeffect(mod_clustering_coco_lm, "clustering", vcov.fun = "vcovCL", vcov.type = "HC1", 
+  vcov.args = list(cluster = df_network_weighted_coco$user_id))
+clustering_plot
+ggplot(clustering_plot, aes(x, predicted)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1)
+
+mod_in_between_coco = felm(i_we ~ indegree + log_tenure | race+gender+department+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_out_between_coco = felm(i_we ~ outdegree + log_tenure | race+gender+department+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_eigen_between_coco = felm(i_we ~ eigenvalue_centrality + log_tenure  | race+gender+department+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_between_between_coco = felm(i_we ~ betweenness_centrality + log_tenure | race+gender+department+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_clustering_between_coco = felm(clustering ~ past_i_we + log_tenure + degree | race+gender+department+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_constraint_between_coco = felm(constraint ~ past_i_we + log_tenure + degree | race+gender+department+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_gender_diversity_between_coco = felm(i_we ~ gender_diversity + log_tenure  | race+gender+department+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_gender_ingroup_between_coco = felm(i_we ~ gender_ingroup + log_tenure | race+gender+department+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_race_diversity_between_coco = felm(i_we ~ race_diversity + log_tenure  | race+gender+department+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_race_ingroup_between_coco = felm(i_we ~ race_ingroup + log_tenure | race+gender+department+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_ei_between_coco = felm(i_we ~ ei_index + log_tenure | race+gender+department+quarter | 0 | user_id, data=df_network_weighted_coco)
+
+summary(mod_in_between_coco)
+summary(mod_out_between_coco)
+summary(mod_eigen_between_coco)
+summary(mod_between_between_coco)
+summary(mod_clustering_between_coco)
+summary(mod_constraint_between_coco)
+summary(mod_gender_diversity_between_coco)
+summary(mod_gender_ingroup_between_coco)
+summary(mod_race_diversity_between_coco)
+summary(mod_race_ingroup_between_coco)
+summary(mod_ei_between_coco)
+
+# in spacespace between person constraint is pos+sig; within-person only weakly - including tenure, num tokens, num messages, and is supervisor as controls. Adding quarter as control doesn't change much. Constraint not lagged in spsp
+
+```
+
+```{r, results='asis', warning=FALSE}
+stargazer(mod_effort_within_coco, mod_peer_within_coco, mod_response_within_coco, mod_effort_within_corpcorp, mod_peer_within_corpcorp, mod_response_within_corpcorp, mod_effort_within_spsp, mod_peer_within_spsp, mod_response_within_spsp, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Identification on Effort", add.lines = list(c("Person Fixed Effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes"), c("Quarter Fixed effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes")), covariate.labels = c('cossim(I, we)'))
+
+stargazer(mod_effort_between_coco, mod_peer_between_coco, mod_response_between_coco, mod_effort_between_corpcorp, mod_peer_between_corpcorp, mod_response_between_corpcorp, mod_effort_between_spsp, mod_peer_between_spsp, mod_response_between_spsp, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Identification on Effort", add.lines = list(c("Person Fixed Effects", "No", "No", "No", "No", "No", "No", "No", "No", "No"), c("Quarter Fixed effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes")), covariate.labels = c('cossim(I, we)'))
+
+stargazer(mod_in_coco_avg_idtf, mod_out_coco_avg_idtf, mod_eigen_coco_avg_idtf, mod_between_coco_avg_idtf, mod_clustering_coco_avg_idtf, mod_constraint_coco_avg_idtf, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Identification on Network Positions", add.lines = list(c("Person Fixed Effects", "No",  "No", "No", "No", "No", "No"), c("Quarter Fixed effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes")), covariate.labels = c("Lagged Indegree", "Lagged Outdegree", "Lagged Eigenvalue Centrality", "Lagged Betweenness Centrality", "Lagged Clustering", "Lagged Constraint", "Logged Tenure", "Degree"))
+
+stargazer(mod_in_coco_num_we, mod_out_coco_num_we, mod_eigen_coco_num_we, mod_between_coco_num_we, mod_clustering_coco_num_we, mod_constraint_coco_num_we, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Identification on Network Positions", add.lines = list(c("Person Fixed Effects", "No",  "No", "No", "No", "No", "No"), c("Quarter Fixed effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes")), covariate.labels = c("Lagged Indegree", "Lagged Outdegree", "Lagged Eigenvalue Centrality", "Lagged Betweenness Centrality", "Lagged Clustering", "Lagged Constraint", "Logged Tenure", "Degree"))
+
+stargazer(mod_in_coco, mod_out_coco, mod_eigen_coco, mod_between_coco, mod_clustering_coco, mod_constraint_coco, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Identification on Network Positions", add.lines = list(c("Person Fixed Effects", "No",  "No", "No", "No", "No", "No"), c("Quarter Fixed effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes")), covariate.labels = c("Lagged Indegree", "Lagged Outdegree", "Lagged Eigenvalue Centrality", "Lagged Betweenness Centrality", "Lagged Clustering", "Lagged Constraint", "Logged Tenure", "Degree"))
+
+stargazer(mod_clustering_coco, mod_constraint_coco, mod_clustering_corpcorp, mod_constraint_corpcorp, mod_clustering_spsp, mod_constraint_spsp, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Identification on Clustering and Constraint", add.lines = list(c("Person Fixed Effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes"), c("Quarter Fixed effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes")), covariate.labels = c("Clustering", "Constraint", "Logged Tenure", "Degree"))
+
+stargazer(mod_gender_diversity_coco, mod_gender_ingroup_coco, mod_race_diversity_coco, mod_race_ingroup_coco, mod_ei_coco, mod_gender_diversity_corpcorp, mod_gender_ingroup_corpcorp, mod_ei_corpcorp, mod_gender_diversity_spsp, mod_gender_ingroup_spsp, mod_race_diversity_spsp, mod_race_ingroup_spsp, mod_ei_spsp, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Identification on Network Composition", add.lines = list(c("Person Fixed Effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes"), c("Quarter Fixed effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "Yes")), covariate.labels = c("Gender Diversity", "Gender Ingroup Proportion", "Racial Diversity", "Racial Ingroup Proportion", "EI Index"))
+
+stargazer(mod_clustering_past_network_coco, mod_constraint_past_network_coco, mod_clustering_past_network_corpcorp, mod_constraint_past_network_corpcorp, mod_clustering_past_network_spsp, mod_constraint_past_network_spsp, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Identification on Lagged Clustering and Constraint", add.lines = list(c("Person Fixed Effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes"), c("Quarter Fixed effects", "No", "No", "No", "No", "No", "No")), covariate.labels = c("Lagged Clustering", "Lagged Constraint", "Logged Tenure", "Degree"))
+
+stargazer(mod_clustering_past_i_we_coco, mod_constraint_past_i_we_coco, mod_clustering_past_i_we_corpcorp, mod_constraint_past_i_we_corpcorp, mod_clustering_past_i_we_spsp, mod_constraint_past_i_we_spsp, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Clustering and Constraint on Lagged Identification", add.lines = list(c("Person Fixed Effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes"), c("Quarter Fixed effects", "No", "No", "No", "No", "No", "No")), covariate.labels = c("Lagged cossim(I, we)", "Logged Tenure", "Degree"))
+
+stargazer(mod_eigen_past_network_qfe_coco, mod_between_past_network_qfe_coco, mod_eigen_past_network_qfe_corpcorp, mod_between_past_network_qfe_corpcorp, mod_eigen_past_network_qfe_spsp, mod_between_past_network_qfe_spsp, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Identification on Lagged Centrality", add.lines = list(c("Person Fixed Effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes"), c("Quarter Fixed effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes")), covariate.labels = c("Lagged Eigenvalue Centrality", "Lagged Betweenness Centrality", "Logged Tenure"))
+
+stargazer(mod_clustering_past_network_qfe_coco, mod_constraint_past_network_qfe_coco, mod_clustering_past_network_qfe_corpcorp, mod_constraint_past_network_qfe_corpcorp, mod_clustering_past_network_qfe_spsp, mod_constraint_past_network_qfe_spsp, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Centrality on Lagged Identification", add.lines = list(c("Person Fixed Effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes"), c("Quarter Fixed effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes")), covariate.labels = c("Lagged Clustering", "Lagged Constraint", "Logged Tenure"))
+
+stargazer(mod_eigen_past_i_we_qfe_coco, mod_between_past_i_we_qfe_coco, mod_eigen_past_i_we_qfe_corpcorp, mod_between_past_i_we_qfe_corpcorp, mod_eigen_past_i_we_qfe_spsp, mod_between_past_i_we_qfe_spsp, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Identification on Lagged Clustering and Constraint", add.lines = list(c("Person Fixed Effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes"), c("Quarter Fixed effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes")), covariate.labels = c("Lagged Composite", "Logged Tenure"))
+
+stargazer(mod_clustering_past_i_we_qfe_coco, mod_constraint_past_i_we_qfe_coco, mod_clustering_past_i_we_qfe_corpcorp, mod_constraint_past_i_we_qfe_corpcorp, mod_clustering_past_i_we_qfe_spsp, mod_constraint_past_i_we_qfe_spsp, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Clustering and Constraint on Lagged Identification", add.lines = list(c("Person Fixed Effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes"), c("Quarter Fixed effects", "Yes",  "Yes", "Yes", "Yes", "Yes", "Yes", "Yes")), covariate.labels = c("Lagged Composite", "Logged Tenure"))
+
+stargazer(mod_eigen_past_i_we_coco, mod_between_past_i_we_coco, mod_clustering_past_i_we_coco, mod_constraint_past_i_we_coco, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Network Positions on Lagged Identification at CoCo", add.lines = list(c("Person Fixed Effects", "Yes",  "Yes", "Yes", "Yes"), c("Quarter Fixed effects", "No",  "No", "No", "No")), covariate.labels = c("Lagged Composite", "Logged Tenure"))
+
+stargazer(mod_eigen_past_network_coco, mod_between_past_network_coco, mod_clustering_past_network_coco, mod_constraint_past_network_coco, digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p$<$0.1; * p$<$0.05; ** p$<$0.01; *** p$<$0.001"), notes.append=F, title="Identification on Lagged Netework Positions at CoCo", add.lines = list(c("Person Fixed Effects", "Yes",  "Yes", "Yes", "Yes"), c("Quarter Fixed effects", "No",  "No", "No", "No")), covariate.labels = c("Lagged Composite", "Logged Tenure"))
+
+```
+
+```{r}
+mod_in = felm(change_i_we ~ change_indegree + log_tenure| user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_out = felm(change_i_we ~ change_outdegree + log_tenure | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_eigen = felm(change_i_we ~ change_eigenvalue_centrality + log_tenure | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_between = felm(change_i_we ~ change_betweenness_centrality + log_tenure| user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_clustering = felm(change_i_we ~ change_clustering + log_tenure | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+mod_constraint = felm(change_i_we ~ change_constraint + log_tenure | user_id+quarter | 0 | user_id, data=df_network_weighted_coco)
+
+summary(mod_in)
+summary(mod_out)
+summary(mod_eigen)
+summary(mod_between)
+summary(mod_clustering)
+summary(mod_constraint)
+```
+
+
+```{r}
+library(plm)
+df_network_plm <- pdata.frame(df_network_weighted_coco, index = c("user_id", "quarter"))
+gmm_indegree = pgmm(i_we ~ lag(i_we, 1) + indegree | lag(indegree, 2:99), df_network_plm, effect = "twoways", transformation = "ld")
+summary(gmm_indegree, robust=TRUE)
+
+gmm_outdegree = pgmm(outdegree ~ lag(i_we, 1) + lag(outdegree, 1) | lag(outdegree, 2:99), df_network_plm, effect = "twoways", transformation = "ld")
+summary(gmm_outdegree, robust=TRUE)
+
+gmm_eigenvalue_centrality = pgmm(eigenvalue_centrality ~ lag(i_we, 1) + lag(eigenvalue_centrality, 1) | lag(eigenvalue_centrality, 2:99), df_network_plm, effect = "twoways", transformation = "ld")
+summary(gmm_eigenvalue_centrality, robust=TRUE)
+
+gmm_betweenness_centrality = pgmm(betweenness_centrality ~ lag(i_we, 1) + lag(betweenness_centrality, 1) | lag(betweenness_centrality, 2:99), df_network_plm, effect = "twoways", transformation = "ld")
+summary(gmm_betweenness_centrality, robust=TRUE)
+
+gmm_constraint = pgmm(constraint ~ lag(i_we, 1) + lag(constraint, 1) | lag(constraint, 2:99), df_network_plm, effect = "twoways", transformation = "ld")
+summary(gmm_constraint, robust=T)
+
+
+```
+

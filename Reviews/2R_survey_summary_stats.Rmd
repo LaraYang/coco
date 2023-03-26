@@ -1,0 +1,383 @@
+---
+title: "R Notebook"
+output: pdf_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r, include=FALSE, warning=FALSE}
+library(stargazer)
+library(ggplot2)
+library(dplyr)
+library(MASS)
+# used to calculate cronbach's alpha
+library(psych)
+# used to produce correlation plots
+library(corrplot)
+# for LDA visualization
+library(LDAvis)
+# for sLDA model
+library(lda)
+# for providing list of stop words
+library(tm)
+# for running btm
+library(BTM)
+library(tidytext)
+library(tidyr)
+library(stringr)
+# for melting
+library(reshape2)
+library(text2vec)
+# for heteroskedastic errors
+library(lmtest)
+library(sandwich)
+```
+
+```{r}
+fn = '~/Downloads/TrackWomen.dat'
+data = read.(fn, sep='\t')
+data = as.matrix(data)
+list(as.numeric(data[,"X100m"]))
+data[,2:ncol(data)] = as.numeric(data[,2:ncol(data)])
+data[order(data[, "Marathon"], decreasing = T),]
+```
+
+```{r}
+rm(list=ls())
+fn = '~/Documents/CompCulture/spacespace/Coco/analyses_data/survey_hr_topic_modeling.csv'
+data = read.csv(fn)
+data = data %>% 
+  rename(
+    uid = X,
+    perf_dummy_2020 = X2020_perf_dummy,
+    perf_dummy_2019 = X2019_perf_dummy,
+    perf_2020 = X2020.Performance,
+    perf_2019 = X2019.Performance,
+    duration = Duration..in.seconds.,
+    job_function = Function,
+    tenure = Length.of.Service.in.Years
+    ) %>% rename_all(function(x) tolower(gsub("\\.+", "_", x)))
+data$race = as.character(data$race)
+data$race[data$race == 'Native Hawaiian or Other Pacific Islander'] = 'Pacific Islander'
+data$race = as.factor(data$race)
+data$perf_dummy_2020 = as.factor(data$perf_dummy_2020)
+data$perf_dummy_2019 = as.factor(data$perf_dummy_2019)
+data$fast_response = as.factor(ifelse(data$duration < quantile(data$duration, 0.1), 1, 0))
+# Standardizing burnout: the higher the score, the more burnout
+data$disengagement_3 = 4-data$disengagement_3
+data$exhaustion_2 = 4-data$exhaustion_2
+data$disengagement = ave(data$disengagement_1, data$disengagement_2, data$disengagement_3)
+data$exhaustion = ave(data$exhaustion_1, data$exhaustion_2, data$exhaustion_3)
+data$burnout = ave(data$disengagement_1, data$disengagement_2, data$disengagement_3, 
+                   data$exhaustion_1, data$exhaustion_2, data$exhaustion_3)
+data$work_country = relevel(as.factor(data$work_country), "U.S.A.")
+data$gender = relevel(as.factor(data$gender), 'Male')
+```
+
+Cronbach's Alphas
+```{r}
+#Placeholder for calculating Cronbach's alpha of survey items and correlation between mael and bergami bagozzi
+summary(alpha(data[c('mael_1', 'mael_2', 'mael_3', 'mael_4', 'mael_5', 'mael_6')]))
+# Low alpha; even lower when we split by subscales
+summary(alpha(data[c('disengagement_1', 'disengagement_2', 'disengagement_3', 'exhaustion_1', 'exhaustion_2', 'exhaustion_3')]))
+
+corr_mat=corr.test(data[c('bergami_org_num', 'bergami_dept_num', 'burnout')],method="spearman")
+colnames(corr_mat$r) = c("Organizational Identification", "Departmental Identification", "Burnout")
+rownames(corr_mat$r) = c("Organizational Identification", "Departmental Identification", "Burnout")
+corrplot(corr_mat$r, p.mat=corr_mat$p, insig='blank', sig.level=0.05, method='color', tl.col='black', addCoef.col='white', number.digits=2, tl.srt=45)
+```
+
+```{r, include=FALSE}
+ggplot(data, aes(x=race, fill=race))+
+  geom_bar()+
+  facet_wrap(~ gender + work_country)+
+  labs(title = 'Demographics',
+       x = 'Race',
+       y = 'Number of Individuals')+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+
+data$age = 2020 - data$year_of_birth
+fixed_data = data[data$age < 100,]
+ggplot(fixed_data, aes(x=age))+
+  geom_histogram(fill='powderblue', bins=10)+
+  facet_wrap(~ gender + work_country)+
+  labs(title = 'Demographics',
+       x = 'Age',
+       y = 'Number of Individuals')+
+  theme_bw()
+
+```
+
+
+```{r, include=FALSE}
+ggplot(data, aes(x=mael_avg))+
+  geom_histogram(fill='lightskyblue2', bins=15)+
+  facet_wrap(~ work_country)+
+  labs(title = 'Organizational Identification: Mael & Ashforth',
+       x = 'Mael & Ashforth Identification',
+       y = 'Number of Individuals')+
+  theme_bw()
+
+ggplot(data, aes(x=bergami_org))+
+  geom_bar(fill='tan3')+
+  facet_wrap(~ gender + work_country)+
+  labs(title = 'Organizational Identification: Bergami & Bagozzi',
+       x = 'Response to Visual Identification Questionnaire',
+       y = 'Number of Individuals')+
+  theme_bw()
+
+ggplot(data, aes(x=bergami_dept))+
+  geom_bar(fill='tan')+
+  facet_wrap(~ gender + work_country)+
+  labs(title = 'Departmental Identification',
+       x = 'Response to Visual Identification Questionnaire',
+       y = 'Number of Individuals')+
+  theme_bw()
+
+ggplot(data=subset(data, !is.na(data$perf_dummy_2020)), aes(x=perf_dummy_2020, fill=perf_dummy_2020))+
+  geom_bar()+
+  facet_wrap(~ work_country)+
+  scale_fill_manual(values=c("lightgray", "lightskyblue2"), labels=c('Not Achieved', 'Achieved'), name="2020 Performance")+
+  labs(title = '2020 Performance',
+       x = '2020 Performance',
+       y = 'Number of Individuals')+
+  theme_bw()
+
+ggplot(data=subset(data, !is.na(data$perf_dummy_2019)), aes(x=perf_dummy_2019, fill=perf_dummy_2019))+
+  geom_bar()+
+  facet_wrap(~ work_country)+
+  scale_fill_manual(values=c("lightgray", "lightskyblue2"), labels=c('Not Achieved', 'Achieved'), name="2019 Performance")+
+  labs(title = '2019 Performance',
+       x = '2019 Performance',
+       y = 'Number of Individuals')+
+  theme_bw()
+
+ggplot(data, aes(x=burnout))+
+  geom_histogram(fill='lightcoral', col='lightcoral', bins=15)+
+  facet_wrap(~ gender + work_country)+
+  labs(title = 'Burnout',
+       x = 'Response to Oldenburg Burnout Inventory',
+       y = 'Number of Individuals')+
+  theme_bw()
+
+ggplot(data, aes(x=disengagement))+
+  geom_histogram(fill='firebrick', col='firebrick', bins=8, alpha=0.9)+
+  facet_wrap(~ work_country)+
+  labs(title = 'Disengagement',
+       x = 'Response to Oldenburg Burnout Inventory (Higher Number = More Disengaged)',
+       y = 'Number of Individuals')+
+  xlim(c(1, 4))+
+  theme_bw()
+
+ggplot(data, aes(x=exhaustion))+
+  geom_histogram(fill='firebrick', col='firebrick', bins=8, alpha=0.9)+
+  facet_wrap(~ work_country)+
+  labs(title = 'Exhaustion',
+       x = 'Response to Oldenburg Burnout Inventory (Higher Number = More Exhausted)',
+       y = 'Number of Individuals')+
+  xlim(c(1, 4))+
+  theme_bw()
+
+```
+
+```{r}
+bergami_dept_avg_department = aggregate(x = data$bergami_dept_num, by = list(data$department), FUN=mean)
+names(bergami_dept_avg_department) = c('department', 'average')
+ggplot(bergami_dept_avg_department, aes(x=department, y=average))+
+  geom_bar(stat='identity', fill='tan')+
+  labs(title = 'Departmental Identification by Department',
+       x = 'Department',
+       y = 'Average Departmental Identification')+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.margin = margin(10,10,10,50))  
+
+
+bergami_dept_avg_division= aggregate(x = data$bergami_dept_num, by = list(data$division), FUN=mean)
+names(bergami_dept_avg_division) = c('division', 'average')
+ggplot(bergami_dept_avg_division, aes(x=division, y=average))+
+  geom_bar(stat='identity', fill='tan')+
+  labs(title = 'Departmental Identification by Division',
+       x = 'Division',
+       y = 'Average Departmental Identification')+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.margin = margin(10,10,10,50))  
+
+```
+
+
+```{r}
+bergami_org_avg_department = aggregate(x = data$bergami_org_num, by = list(data$department), FUN=mean)
+names(bergami_org_avg_department) = c('department', 'average')
+ggplot(bergami_org_avg_department, aes(x=department, y=average))+
+  geom_bar(stat='identity', fill='tan3')+
+  labs(title = 'Organizational Identification by Department',
+       x = 'Department',
+       y = 'Average Organizational Identification')+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.margin = margin(10,10,10,50))  
+
+
+bergami_org_avg_division= aggregate(x = data$bergami_org_num, by = list(data$division), FUN=mean)
+names(bergami_org_avg_division) = c('division', 'average')
+ggplot(bergami_org_avg_division, aes(x=division, y=average))+
+  geom_bar(stat='identity', fill='tan3')+
+  labs(title = 'Organizational Identification by Division',
+       x = 'Division',
+       y = 'Average Organizational Identification')+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.margin = margin(10,10,10,50))  
+
+```
+
+```{r}
+burnout_avg_department = aggregate(x = data$burnout, by = list(data$department), FUN=mean)
+names(burnout_avg_department) = c('department', 'average')
+ggplot(burnout_avg_department, aes(x=department, y=average))+
+  geom_bar(stat='identity', fill='lightcoral')+
+  labs(title = 'Burnout by Department',
+       x = 'Department',
+       y = 'Average Burnout')+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.margin = margin(10,10,10,50))  
+
+
+burnout_avg_division = aggregate(x = data$burnout, by = list(data$division), FUN=mean)
+names(burnout_avg_division) = c('department', 'average')
+ggplot(burnout_avg_division, aes(x=division, y=average))+
+  geom_bar(stat='identity', fill='lightcoral')+
+  labs(title = 'Burnout by Division',
+       x = 'Division',
+       y = 'Average Burnout')+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.margin = margin(10,10,10,50))  
+
+
+```
+
+Performance Rating Across Division
+```{r}
+ggplot(data=subset(data, !is.na(data$perf_dummy_2020)), aes(x=perf_dummy_2020, fill=perf_dummy_2020))+
+  geom_bar()+
+  facet_wrap(~ division)+
+  scale_fill_manual(values=c("lightgray", "lightskyblue2"), labels=c('Not Achieved', 'Achieved'), name="2020 Performance")+
+  labs(title = '2020 Performance',
+       x = '2020 Performance',
+       y = 'Number of Individuals')+
+  theme_bw()
+
+```
+
+Analyses
+```{r}
+# Performance
+# ask for help on what to do with the mael avg measure - it's not being normalized right
+mod_perf_2020 = glm(perf_dummy_2020 ~ log(mael_avg) + work_country + gender + race + tenure + 1, data=data, family=binomial(link=logit))
+summary(mod_perf_2020)
+mod_perf_2020 = glm(perf_dummy_2020 ~ bergami_org_num + work_country + gender + race + tenure + 1, data=data, family=binomial(link=logit))
+summary(mod_perf_2020)
+mod_perf_2020 = glm(perf_dummy_2020 ~ bergami_dept_num + work_country + gender + race + tenure + 1, data=data, family=binomial(link=logit))
+summary(mod_perf_2020)
+mod_perf_2020_burnout = glm(perf_dummy_2020 ~ log(burnout) + work_country + gender + race + tenure, data=data, family=binomial(link=logit))
+summary(mod_perf_2020_burnout)
+
+mod_perf_2019 = glm(perf_dummy_2019 ~ bergami_org_num + work_country + gender + race + department + division + tenure, data=data, family=binomial(link=logit))
+summary(mod_perf_2019)
+mod_perf_2019 = glm(perf_dummy_2019 ~ bergami_dept_num + work_country + gender + race + department + division + tenure, data=data, family=binomial(link=logit))
+summary(mod_perf_2019)
+mod_perf_2019_burnout = glm(perf_dummy_2019 ~ log(burnout) + work_country + gender + race + department + division + tenure, data=data, family=binomial(link=logit))
+summary(mod_perf_2019_burnout)
+
+# Identification
+data$we = data$pros_we + data$story_we
+data$i = data$pros_i + data$story_i
+data$they = data$pros_they + data$story_they
+data$toks_len_control = data$pros_toks_len + data$story_toks_len
+data$log_we_they =  log(data$we/data$they + 1)
+data$log_we =  log(data$we/data$toks_len_control + 1)
+data$log_they = log(data$they/data$toks_len_control + 1)
+mod_bergami_org = polr(as.factor(bergami_org) ~ log_we + toks_len_control + work_country + gender + race + department + tenure + low_quality_pros, data=data[is.finite(data$log_we),], Hess=TRUE)
+ctable = coef(summary(mod_bergami_org))
+p <- pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2
+round(ctable <- cbind(ctable, "p value" = p), 4)
+
+mod_bergami_dept = polr(as.factor(bergami_dept) ~ log_we_they + toks_len_control + work_country + gender + race + department + tenure + low_quality_pros + 1, data=data[is.finite(data$log_we_they),], Hess=TRUE)
+ctable = coef(summary(mod_bergami_dept))
+p <- pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2
+round(ctable <- cbind(ctable, "p value" = p), 4)
+
+mod_bergami_org = lm(bergami_org_num ~ log_we + toks_len_control + work_country + gender + race + division + low_quality_pros + tenure + 1, data=data[is.finite(data$log_we),])
+summary(mod_bergami_org)
+
+mod_bergami_dept = lm(bergami_dept_num ~ log_we + toks_len_control + work_country + gender + race + department + low_quality_pros + tenure + 1, data=data[is.finite(data$log_we),])
+summary(mod_bergami_dept)
+```
+
+```{r}
+mod_bergami_org_controls = lm(bergami_org_num ~ gender + race + work_country + tenure + 1, data=data)
+results_bergami_org_controls = coeftest(mod_bergami_org_controls, vcov=vcovHC(mod_bergami_org_controls, type="HC0"))
+
+mod_bergami_dept_controls = lm(bergami_dept_num ~ gender + race + work_country + tenure + 1, data=data)
+results_bergami_dept_controls = coeftest(mod_bergami_dept_controls, vcov=vcovHC(mod_bergami_dept_controls, type="HC0"))
+
+mod_burnout_controls = lm(burnout ~ gender + race + work_country + tenure + 1, data=data)
+results_burnout_controls = coeftest(mod_burnout_controls, vcov=vcovHC(mod_burnout_controls, type="HC0"))
+
+mod_exhausion_controls = lm(exhaustion ~ gender + race + work_country + tenure + 1, data=data)
+results_exhausion_controls = coeftest(mod_exhausion_controls, vcov=vcovHC(mod_exhausion_controls, type="HC0"))
+
+mod_disengagement_controls = lm(disengagement ~ gender + race + work_country + tenure + 1, data=data)
+results_disengagement_controls = coeftest(mod_disengagement_controls, vcov=vcovHC(mod_exhausion_controls, type="HC0"))
+
+```
+
+```{r}
+mod_bergami_org_controls = lm(bergami_org_num ~ gender + race + work_country + department + tenure + 1, data=data)
+results_bergami_org_controls = coeftest(mod_bergami_org_controls, vcov=vcovHC(mod_bergami_org_controls, type="HC0"))
+
+mod_bergami_dept_controls = lm(bergami_dept_num ~ gender + race + work_country + tenure + 1, data=data)
+results_bergami_dept_controls = coeftest(mod_bergami_dept_controls, vcov=vcovHC(mod_bergami_dept_controls, type="HC0"))
+
+mod_burnout_controls = lm(burnout ~ gender + race + work_country + tenure + 1, data=data)
+results_burnout_controls = coeftest(mod_burnout_controls, vcov=vcovHC(mod_burnout_controls, type="HC0"))
+
+mod_exhausion_controls = lm(exhaustion ~ gender + race + work_country + tenure + 1, data=data)
+results_exhausion_controls = coeftest(mod_exhausion_controls, vcov=vcovHC(mod_exhausion_controls, type="HC0"))
+
+mod_disengagement_controls = lm(disengagement ~ gender + race + work_country + tenure + 1, data=data)
+results_disengagement_controls = coeftest(mod_disengagement_controls, vcov=vcovHC(mod_exhausion_controls, type="HC0"))
+
+
+```
+
+```{r, echo=FALSE, results='asis'}
+stargazer(mod_bergami_org_controls,
+          se=list(results_bergami_org_controls[,2]),
+           title="Modeling Organizational Identification", dep.var.labels='Organizational Identification', covariate.labels=c('Female', "African American", "Hispanic or Latino", "Missing", "Pacific Islander", "White", "Canada", "India", "Tenure"), dep.var.caption = "", digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p<0.1; * p<0.05; ** p<0.01; *** p<0.001"), notes.append=F, out='tab1.tex')
+
+stargazer(mod_bergami_dept_controls,
+          se=list(results_bergami_dept_controls[,2]),
+           title="Modeling Organizational Identification", dep.var.labels='Departmental Identification', covariate.labels=c('Female', "African American", "Hispanic or Latino", "Missing", "Pacific Islander", "White", "Canada", "India", "Tenure"), dep.var.caption = "", digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p<0.1; * p<0.05; ** p<0.01; *** p<0.001"), notes.append=F, out='tab2.tex')
+
+stargazer(mod_burnout_controls,
+          se=list(results_burnout_controls[,2]),
+           title="Modeling Burnout", dep.var.labels='Burnout', covariate.labels=c('Female', "African American", "Hispanic or Latino", "Missing", "Pacific Islander", "White", "Canada", "India", "Tenure"), dep.var.caption = "", digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p<0.1; * p<0.05; ** p<0.01; *** p<0.001"), notes.append=F, out='tab3.tex')
+
+stargazer(mod_exhausion_controls,
+          se=list(results_exhausion_controls[,2]),
+           title="Modeling Burnout: Exhaustion", dep.var.labels='Exhaustion', covariate.labels=c('Female', "African American", "Hispanic or Latino", "Missing", "Pacific Islander", "White", "Canada", "India", "Tenure"), dep.var.caption = "", digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p<0.1; * p<0.05; ** p<0.01; *** p<0.001"), notes.append=F, out='tab4.tex')
+
+stargazer(mod_disengagement_controls,
+          se=list(results_disengagement_controls[,2]),
+           title="Modeling Burnout: Disengagement", dep.var.labels='Disengagement', covariate.labels=c('Female', "African American", "Hispanic or Latino", "Missing", "Pacific Islander", "White", "Canada", "India", "Tenure"), dep.var.caption = "", digits=3, header=F, star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p<0.1; * p<0.05; ** p<0.01; *** p<0.001"), notes.append=F, out='tab4.tex')
+
+
+```
+
+LIWC: affiliation ; family ; anthropomophization ; sentiment analyses + subjectivity

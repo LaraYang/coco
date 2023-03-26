@@ -1,0 +1,237 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+```{r}
+library(dplyr)
+library(pROC)
+library(psych)
+library(OneR)
+library(ggplot2)
+library(corrplot)
+library(RColorBrewer)
+library(lfe)
+library(stargazer)
+```
+
+
+```{r}
+survey_data = read.csv('/ifs/gsb/amirgo/spacespace/spacespace/Coco/analyses_data/coco_glassdoor_topic_modeling.csv')
+head(survey_data)
+survey_data = survey_data %>% 
+  rename(
+    perf_dummy_2020 = X2020_perf_dummy,
+    perf_dummy_2019 = X2019_perf_dummy,
+    perf_2020 = X2020.Performance,
+    perf_2019 = X2019.Performance,
+    duration = Duration..in.seconds.,
+    job_function = Function,
+    tenure = Length.of.Service.in.Years
+    ) %>% rename_all(function(x) tolower(gsub("\\.+", "_", x)))
+survey_data$race = as.factor(survey_data$race)
+survey_data$perf_dummy_2020 = as.factor(survey_data$perf_dummy_2020)
+survey_data$perf_dummy_2019 = as.factor(survey_data$perf_dummy_2019)
+survey_data$bin_bergami = ifelse(survey_data$bergami_org_num >= 6, 1, 0)
+k=10
+pros_names = paste("pros_topic", seq(1,k), sep="")
+cons_names = paste("cons_topic", seq(1,k), sep="")
+
+survey_america = survey_data[survey_data$work_country!="India",]
+
+```
+
+```{r}
+corr.test(survey_america[,c('bergami_org_num', pros_names)], method='spearman', adjust='none')
+corr.test(survey_america[,c('bergami_org_num', cons_names)], method='spearman', adjust='none')
+
+# could add tenure and gender in future iterations as both variables are present in both datasets
+formula = as.formula(paste("bergami_org_num ~ 1", paste(c(pros_names[1:5], pros_names[7:10]), collapse='+'),  paste(c(cons_names[1:3], cons_names[5:10]), collapse='+'), sep=" + "))
+mod_bergami = lm(formula, data=survey_america)
+summary(mod_bergami)
+
+idtf_datapoints = cbind(predict(mod_bergami), survey_america$bergami_org_num, survey_america$mael_avg)
+colnames(idtf_datapoints) = c("Topic Model Predicted", "Survey: B&B", "Survey: M&A")
+corr_mat = corr.test(idtf_datapoints, adjust='none')
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='lower', insig='blank', sig.level=0.05, method='color', tl.col='black', addCoef.col='black', number.digits=2, tl.srt=0, diag=F)
+
+```
+
+```{r}
+corr.test(survey_america[,c('mael_avg', pros_names)], method='pearson', adjust='none')
+corr.test(survey_america[,c('mael_avg', cons_names)], method='pearson', adjust='none')
+
+set.seed(12345)
+samp_size = floor(0.8 * nrow(survey_america))
+train_inx = sample(seq_len(nrow(survey_america)), size=samp_size)
+
+formula = as.formula(paste("mael_avg ~ 1", paste(c(pros_names[c(1:3, 5:10)]), collapse='+'),  paste(c(cons_names[c(1:5, 7:10)]), collapse='+'), sep=" + "))
+mod_mael = lm(formula, data=survey_america[train_inx,])
+summary(mod_mael)
+
+idtf_datapoints = cbind(predict(mod_mael, survey_america[-train_inx,]), survey_america$bergami_org_num[-train_inx], survey_america$mael_avg[-train_inx])
+colnames(idtf_datapoints) = c("Topic Model Predicted", "Survey: B&B", "Survey: M&A")
+corr_mat = corr.test(idtf_datapoints, adjust='none')
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='lower', insig='blank', sig.level=0.05, method='color', tl.col='black', addCoef.col='black', number.digits=2, tl.srt=0, diag=F)
+
+```
+
+```{r}
+pro_topics = read.csv('/ifs/projects/amirgo-identification/glassdoor_data/glassdoor_pros_top_words_lda_k10.csv', header=TRUE)
+con_topics = read.csv('/ifs/projects/amirgo-identification/glassdoor_data/glassdoor_cons_top_words_lda_k10.csv', header=TRUE)
+top_words = 10
+pro_topics = pro_topics[,2:(top_words+1)] %>% apply(1, paste, collapse = ",")
+pro_topics = paste('pros_topic', seq(1:k), ': ', pro_topics, sep='')
+con_topics = con_topics[,2:(top_words+1)] %>% apply(1, paste, collapse = ",")
+con_topics = paste('cons_topic', seq(1:k), ': ', con_topics, sep='')
+topics = c(pro_topics[c(1:3, 5:10)],con_topics[c(1:5, 7:10)])
+coefs <- data.frame(coef(summary(mod_mael)))[2:19,]
+coefs <- cbind(coefs, topics = factor(topics, topics[order(coefs$Estimate, coefs$Std..Error)]))
+coefs <- coefs[order(coefs$Estimate), ]
+getPalette = colorRampPalette(brewer.pal(9, "Spectral"))
+colourCount = 18
+coefs$Estimate = coefs$Estimate + coef(summary(mod_mael))[1]
+pro_topics
+coefs %>% ggplot(aes(topics, Estimate, colour = factor(Estimate))) + geom_point() + geom_errorbar(width = 0.5, size=1.5,
+    aes(ymin = Estimate - 1.96 * Std..Error, ymax = Estimate + 1.96 * Std..Error)) + 
+    coord_flip() + theme_classic() +
+    theme(legend.position = "none") +
+    labs(y = "Coefficient", x="", title = "Coefficients of Different Topics")+
+    scale_color_manual(values = getPalette(colourCount))
+  
+    
+
+```
+
+```{r}
+library(data.table)
+
+glassdoor_companies = read.csv('/ifs/projects/amirgo-identification/glassdoor_data/glassdoor_companies.csv')
+# Dropping Pandas index
+glassdoor_companies = glassdoor_companies[,-c(1)]
+glassdoor_companies$num_employees = ifelse(glassdoor_companies$num_employees == 0, NA, glassdoor_companies$num_employees)
+glassdoor_companies$revenue_annual = ifelse(glassdoor_companies$revenue_annual == 0, NA, glassdoor_companies$revenue_annual)
+glassdoor_companies$revenue_annual = ifelse(glassdoor_companies$revenue_annual == -1, NA, glassdoor_companies$revenue_annual)
+
+# data.tables read much faster
+glassdoor_topics = fread('/ifs/projects/amirgo-identification/glassdoor_data/glassdoor_topic_prop.csv')
+glassdoor_reviews = fread('/ifs/projects/amirgo-identification/glassdoor_data/glassdoor_reviews_custom.csv', select=c(2, 22, 11, 15, 16))
+
+glassdoor_topics = as.data.frame(glassdoor_topics)
+glassdoor_reviews = as.data.frame(glassdoor_reviews)
+```
+
+Tenure validity check
+```{r}
+glassdoor_topics$predicted_idtf = predict(mod_mael, newdata = glassdoor_topics[, c(pros_names, cons_names)])
+cor.test(glassdoor_topics$predicted_idtf, glassdoor_topics$len_employment)
+
+glassdoor_topics = merge(glassdoor_topics, glassdoor_reviews, on='review_id')
+glassdoor_topics$year = year(glassdoor_topics$datetime)
+
+remove(glassdoor_reviews)
+```
+
+Companies
+```{r}
+average_idtf = aggregate(glassdoor_topics$predicted_idtf, by=list(glassdoor_topics$employer_id), FUN=mean)
+names(average_idtf) = c('employer_id', 'idtf')
+average_idtf$num_reviews = table(glassdoor_topics$employer_id)
+
+glassdoor_idtf_cs = merge(glassdoor_companies, average_idtf, by='employer_id')
+glassdoor_idtf_cs$num_reviews = c(glassdoor_idtf_cs$num_reviews)
+
+companies_model = felm(idtf ~ 1 + log(num_employees) + log(revenue_annual) | industry + employer_type, data=glassdoor_idtf_cs[glassdoor_idtf_cs$num_reviews > 10,])
+summary(companies_model)
+```
+
+```{r}
+harris_poll = read.csv('/ifs/projects/amirgo-identification/glassdoor_data/harris_glassdoor_2021.csv')
+forbes_poll = read.csv('/ifs/projects/amirgo-identification/glassdoor_data/forbes_glassdoor_2021.csv')
+
+harris_poll = harris_poll[, c('rank', 'employer_id', 'score')]
+names(harris_poll) = c("harris_rank", "employer_id", "harris_score")
+harris_poll$harris_rated = 1
+
+forbes_poll = forbes_poll[, c('rank', 'employer_id')]
+names(forbes_poll) = c('forbes_rank', 'employer_id')
+forbes_poll$forbes_rated = 1
+
+glassdoor_idtf_cs = merge(glassdoor_idtf_cs, harris_poll, by='employer_id', all.x = T)
+glassdoor_idtf_cs = merge(glassdoor_idtf_cs, forbes_poll, by='employer_id', all.x = T)
+
+glassdoor_idtf_cs$harris_rated[is.na(glassdoor_idtf_cs$harris_rated)] = 0
+glassdoor_idtf_cs$forbes_rated[is.na(glassdoor_idtf_cs$forbes_rated)] = 0
+
+# Identification ever
+summary(felm(idtf ~ 1 + forbes_rated + log(num_employees) + log(revenue_annual) | employer_type + industry , data=glassdoor_idtf_cs))
+summary(felm(idtf ~ 1 + harris_rated + log(num_employees) + log(revenue_annual) | employer_type + industry , data=glassdoor_idtf_cs))
+
+# Identification for 2021
+average_idtf_annual = aggregate(glassdoor_topics$predicted_idtf, by=list(glassdoor_topics$employer_id, glassdoor_topics$year), FUN=mean)
+names(average_idtf_annual) = c('employer_id', 'year', 'idtf')
+num_reviews = glassdoor_topics %>% count(employer_id, year)
+names(num_reviews) = c('employer_id', 'year', 'num_reviews')
+average_idtf_annual = merge(average_idtf_annual, num_reviews, on=c("employer_id", "year"))
+
+glassdoor_idtf_panel = merge(glassdoor_companies, average_idtf_annual, by=c('employer_id'))
+
+forbes_poll = read.csv('/ifs/projects/amirgo-identification/glassdoor_data/forbes_glassdoor_2019.csv')
+forbes_poll$forbes_rated = 1
+forbes_poll = forbes_poll[, c('employer_id', 'forbes_rated')]
+
+combined_df = merge(glassdoor_idtf_panel[glassdoor_idtf_panel$year == 2019,], forbes_poll, by='employer_id', all.x = T)
+combined_df$forbes_rated[is.na(combined_df$forbes_rated)] = 0
+
+summary(felm(idtf ~ 1 + forbes_rated + log(num_employees+1) + log(revenue_annual) | employer_type + industry , data=combined_df[combined_df$num_reviews > 10,]))
+
+```
+
+```{r}
+stargazer(companies_model, title='Predicting Average Organizational Identification Using Size and Revenue', header=FALSE, add.lines=list(c('Industry Fixed Effects', 'Yes')), dep.var.labels  = "Predicted Identification (On 8-point Scale)", star.char = c("+", "*", "**", "***"), star.cutoffs = c(.1, .05, .01, .001), notes = c("+ p<0.1; * p<0.05; ** p<0.01; *** p<0.001"), notes.append=F)
+
+```
+
+Plot identification by sector
+```{r}
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+plot_group_idtf = function(colname, title, xlab, ylab) {
+  averaged_df <- data_summary(glassdoor_companies, varname="idtf", 
+                    groupnames=c(colname))
+  colourCount = length(unique(glassdoor_companies[, colname]))
+  getPalette = colorRampPalette(brewer.pal(9, "Pastel1"))
+  
+  return(ggplot(averaged_df, aes_string(x=paste0("reorder(",colname,", -idtf)"), y='idtf', fill=paste0("reorder(",colname,", -idtf)"))) + 
+    geom_bar(stat="identity") +
+    labs(title=title, x=xlab, y = ylab)+
+    theme_bw()+
+    theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1), legend.position = "none")+
+    scale_fill_manual(values = getPalette(colourCount)))
+}
+```
+
+```{r}
+plot_group_idtf('sector', 'Organizational Identification by Sector', 'Sector', 'Identification')
+
+plot_group_idtf('employer_type', 'Organizational Identification by Organization Type', 'Type', 'Identification')
+
+plot_group_idtf('industry', 'Organizational Identification by Industry', 'Industry', 'Identification')
+glassdoor_companies = glassdoor_companies[glassdoor_companies$num_reviews > 10,]
+glassdoor_companies[order(glassdoor_companies$idtf, decreasing=F),]
+
+```
+
