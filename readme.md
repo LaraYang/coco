@@ -1,9 +1,9 @@
-This folder contains all code involved in analyzing Collabera and Glassdoor open-ended texts
+This folder contains all code involved in analyzing Coco and Glassdoor open-ended texts
 Order of scripts is chronological: later scripts depend on output produced by earlier scripts
 Steps are not necessarily consecutive in nature: e.g., deductive linguistic feature modeling is a separate approach from topic modeling glassdoor reviews
 
 Step 1: Preprocessing Survey Data
-	Input: Collabera/Data/Collabera_Survey_Responses_all.csv, Collabera/Data/Collabera_HR_Perf.csv
+	Input: Coco/Data/Coco_Survey_Responses_all.csv, Coco/Data/Coco_HR_Perf.csv
 	Output: analyses_data/preprocessed_survey_hr.csv
 	Essential preprocessing steps: naming qualtric responses, averaging identification, and converting letters to numbers
 	No preprocessing is done on open-ended texts
