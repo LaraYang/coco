@@ -54,7 +54,7 @@ prep_df = function(data, idtf_measures, timekey) {
   data$race = as.factor(data$race)
   data$perf_dummy_2020 = as.factor(data$perf_dummy_2020)
   data$perf_dummy_2019 = as.factor(data$perf_dummy_2019)
-  data$gender = relevel(data$gender, "Male")
+  data$gender = relevel(as.factor(data$gender), "Male")
   data = data[is.finite(data$duration),]
   data$fast_response = as.factor(ifelse(data$duration < quantile(data$duration, 0.1), 1, 0))
   for (n in idtf_measures) {
@@ -66,7 +66,11 @@ prep_df = function(data, idtf_measures, timekey) {
   data$perf_percentage_2020 = (log(as.numeric(gsub("%", "", data$perf_percentage_2020))+1))
   data$perf_rating_2019 = as.numeric(as.character(data$perf_rating_2019))
   data$perf_percentage_2019 = (log(as.numeric(gsub("%", "", data$perf_percentage_2019))+1))
-  data$work_country = relevel(data$work_country, 'U.S.A.')
+  data$work_country = relevel(as.factor(data$work_country), 'U.S.A.')
+  data$exhaustion_2 = 6-data$exhaustion_2
+  data$exhaustion = rowMeans(data[, c("exhaustion_1", "exhaustion_2", "exhaustion_3")])
+  data$disengagement_3 = 6-data$disengagement_3
+  data$disengagement = rowMeans(data[, c("disengagement_1", "disengagement_2", "disengagement_3")])
   return(data)
 }
 
@@ -96,8 +100,9 @@ idtf_measures_internal = c(paste0(idtf_measures, '_internal'), "i_int_we_ext", "
 
 idtf_measures_external = paste0(idtf_measures, '_external')
 
-df_quarterly = prep_df(df_quarterly, c(idtf_measures_internal, idtf_measures_external), 'quarter')
-
+df_quarterly = prep_df(df_quarterly, c(idtf_measures_internal), 'quarter')
+df_cf = read.csv("/zfs/projects/faculty/amirgo-identification/analyses_data/cf_all.csv")
+df_quarterly = merge(df_quarterly, df_cf, all.x=T)
 ```
 
 Special Processing for DF Quarterly
@@ -126,6 +131,18 @@ corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='blank', sig.level=0.0
 corr_mat = corr.test(df_quarterly[df_quarterly$quarter == '2020Q3' & df_quarterly$work_country != "India", c('i_we_internal', 'bergami_org_num', 'mael_avg')], method='spearman', adjust='none')
 corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='blank', sig.level=0.05, method='color', tl.col='black',  number.digits=3, tl.srt=15, diag=F, title="Correlation Matrix for Quarterly Embeddings", mar=c(0,0,1,0), addCoef.col="black")
 nrow(df_quarterly[df_quarterly$quarter == '2020Q3' & df_quarterly$work_country != "India", c('i_we_internal', 'bergami_org_num', 'mael_avg')])
+```
+
+Burnout
+```{r}
+corr_mat = corr.test(df_quarterly[df_quarterly$quarter == "2020Q3" & df_quarterly$work_country != "India", c("i_we_internal", "exhaustion_1", "exhaustion_2", "exhaustion_3", "exhaustion", "disengagement_1", "disengagement_2", "disengagement_3", "disengagement")], method='spearman', adjust='none')
+rownames(corr_mat$r) = colnames(corr_mat$r) = c("Language-Based Identification","Exhaustion: Item 1", "Exhaustion: Item 2", "Exhaustion: Item 3", "Exhaustion", "Disengagement: Item 1", "Disengagement: Item 2", "Disengagement: Item 3", "Disengagement")
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='pch', sig.level=0.05, method='color', tl.col='black',  number.digits=3, tl.srt=15, diag=F, title="Correlation Matrix for Language-Based Identification and Burnout", mar=c(0,0,1,0), addCoef.col="black")
+
+corr_mat = corr.test(df_quarterly[df_quarterly$quarter == "2020Q3" & df_quarterly$work_country != "India", c("i_we_internal", "mael_avg", "exhaustion_1", "exhaustion_2", "exhaustion_3", "exhaustion", "disengagement_1", "disengagement_2", "disengagement_3", "disengagement")], method='spearman', adjust='none')
+rownames(corr_mat$r) = colnames(corr_mat$r) = c("Language-Based Identification", "Survey-Based Identification", "Exhaustion: Item 1", "Exhaustion: Item 2", "Exhaustion: Item 3", "Exhaustion", "Disengagement: Item 1", "Disengagement: Item 2", "Disengagement: Item 3", "Disengagement")
+corrplot(corr_mat$r,p.mat=corr_mat$p, type='upper', insig='pch', sig.level=0.05, method='color', tl.col='black',  number.digits=3, tl.srt=15, diag=F, title="Correlation Matrix for Identification and Burnout", mar=c(0,0,1,0), addCoef.col="black")
+
 ```
 
 Analyzing all measures using I and we
